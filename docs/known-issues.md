@@ -1,5 +1,35 @@
 # 已知问题
 
+## 拖动窗口时画面撕裂（已修复：`macos/nullarc/4-dbuf.sh` + `macos/display`）
+
+快速拖动窗口时，窗口内容被横向切成两截，停下后立刻恢复。
+
+原因：nullarc 0.4.0 在 780M 上不做硬件翻页，每一帧由 CPU 直接拷进正在被扫描的那一块缓冲（`nvAccelIopFlip` 只对
+NVIDIA 生效）。拷贝时机由软件 VBL 定时器决定，和面板真实的 vblank 没有相位关系，扫描线落在哪里就从哪里撕开。
+
+修复（`patches/phxaccel-dbuf.patch`，基于 v0.4.0-alpha）：在 carve-out 偏移 512 MiB 处再放一块扫描缓冲，帧拷进
+不在屏幕上的那一块，再把 HUBP0 的 `PRIMARY_SURFACE_ADDRESS` 指过去，由 DCN 在 vblank 锁存；写之前等上一次
+`FLIP_PENDING` 清零。启用前逐项对照硬件当前状态（扫描地址、pitch、线性布局、FB 窗口、system aperture、
+update lock），任何一项不符就保持原来的单缓冲。
+
+- 开关 `debug.phxfb_dbuf`：0 关（驱动默认）、1 开、N>1 试用 N 秒后自动退回。`macos/display` 开机设为 1。
+- 状态：`sysctl debug.phxfb_dbuf_state`（1 生效；负数为拒绝原因，含义见 `sysctl -d debug.phxfb_dbuf_state`），
+  `debug.phxfb_dbuf_flips` / `_wait_timeouts` / `_wait_max_us`。
+- 本机实测：约 6000 次翻页、0 次超时，最长等待约 15 ms（不到一帧）。
+
+## 动画残影，一截图就消失（nullarc B-58，已绕过：`macos/display`）
+
+打开带弹出动画的软件时，动画中途的画面（或鼠标指针）残留在屏幕上；截图时 WindowServer 重新合成，残影消失，
+所以截不到。
+
+原因：默认 `debug.nvaccel_surface_gpu_on=1` 时，WindowServer 不等 GPU 合成完成就交出画面，改由内核按标记等待；
+这套等待有遗漏，会显示没画完的画面。上游尚未定位根因（BUGS.md B-58，`docs/AUDIT-2026-11-14.md`）。本机与撕裂无关：
+双缓冲打开、`surface_gpu_on=1` 时残影照样出现，并记录到一次 `debug.nvaccel_surface_gpu_timeouts`。
+
+- 绕过：`debug.nvaccel_surface_gpu_on=0`，并在 `/Library/GPUBundles/nvmtl/nvrm610.conf` 写入
+  `NVMTL_WS_WAIT_COMPLETION=1`，让 WindowServer 自己等每次合成完成。`macos/display/install.sh` 两项都做。
+- 代价：WindowServer 每帧多等一次 GPU，帧率可能略低。
+
 ## 核显空闲时仍"忙碌"（nullarc#14）
 
 `GRBM_STATUS = 0xa800302c`（`macos/check.sh` 会显示）。nullarc 0.4.0 的 mesboot 没有设置 `CP_MEC_DOORBELL_RANGE`，

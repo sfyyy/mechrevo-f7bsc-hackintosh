@@ -9,7 +9,7 @@
 | 部件 | 型号 | 状态 |
 |---|---|---|
 | CPU | Ryzen 7 7840H（Zen 4, Phoenix） | ✅ AMD Vanilla 补丁 + AMDRyzenCPUPowerManagement（`ryzenidle=1`） |
-| 核显 | Radeon 780M `1002:15bf` | ✅ nullarc 0.4.0：Metal 3，WindowServer 由 GPU 合成（M2）；见已知问题 |
+| 核显 | Radeon 780M `1002:15bf` | ✅ nullarc 0.4.0：Metal 3，WindowServer 由 GPU 合成（M2）；双缓冲补丁修复拖动撕裂；见已知问题 |
 | 显示 | HDMI 外接 2560×1440@60 | ✅ 固件 GOP 点亮的单一模式；❌ 无 HiDPI |
 | Wi-Fi | Intel AX210 | ✅ AirportItlwm 2.4.0 |
 | 蓝牙 | Intel AX210 `8087:0032` | ⚠️ IntelBluetoothFirmware + IntelBTPatcher 2.5.3、NVRAM 失败标记重置；部署后未记录实测结论 |
@@ -28,7 +28,8 @@ EFI/                OpenCore（config.plist 中的机器身份为占位值）
 ACPI/               SSDT 源码（.dsl）
 linux/              部署 EFI 到 ESP 的脚本、systemd-boot 启动项
 macos/
-  nullarc/          780M 驱动安装三步脚本
+  nullarc/          780M 驱动安装脚本（1–3 安装，4 双缓冲补丁）与 patches/
+  display/          开机设置：双缓冲、动画残影绕过（LaunchDaemon）
   thermal/          核显限频 800 MHz + 时钟门控（LaunchDaemon）
   check.sh          只读状态检查
 docs/known-issues.md
@@ -82,7 +83,14 @@ Arch ESP（WD 盘，挂载在 `/boot`）：systemd-boot → 「macOS」启动项
 sudo bash macos/nullarc/1-install.sh ~/Downloads/nullarc-0.4.0-alpha.zip   # 仅应用侧 Metal，不接管桌面
 sudo bash macos/nullarc/2-fix-15bf.sh    # 发布包的 PhxAccel 只匹配 0x1900，改成上游的设备列表；然后重启
 sudo bash macos/nullarc/3-enable-m2.sh   # PhxFB 也匹配 15bf 并启用 M2；重启两次后桌面由 GPU 合成
+sudo bash macos/nullarc/4-dbuf.sh        # 重新编译带双缓冲补丁的 PhxAccel（修复拖动撕裂）；需要 Command Line Tools；然后重启
+sudo bash macos/display/install.sh       # 开机打开双缓冲，并绕过动画残影（nullarc B-58）
 ```
+
+- 4-dbuf 从 GitHub 下载 nullarc v0.4.0-alpha 源码和 MacKernelSDK（固定版本，校验 sha256），打上
+  `macos/nullarc/patches/phxaccel-dbuf.patch` 后编译，保留已安装的 Info.plist，备份旧 kext 与 Aux KC。
+  撤销：`sudo bash macos/nullarc/4-dbuf.sh --restore <脚本打印的备份目录>` 后重启。原理见 `docs/known-issues.md`。
+- display 的撤销：`sudo bash macos/display/install.sh --remove` 后重启。日志 `/Users/Shared/f7bsc-logs/phxdisplay.log`。
 
 - 每步日志在 `/Users/Shared/f7bsc-logs/`。重新运行 nullarc 的 `install.sh` 会覆盖 Info.plist，之后需要再跑第 2、3 步。
 - 3-enable-m2 前建议打开自动登录：GPU 路径下登录窗口可能黑屏。

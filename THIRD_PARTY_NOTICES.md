@@ -17,6 +17,13 @@
 
 不随仓库分发（需自行下载）：AMFIPass、SimpleHDA，见 README。
 
+## PhxAccel 补丁（macos/nullarc/patches/phxaccel-dbuf.patch）
+
+补丁修改的是 nullarc `src/phxaccel`（PhxAccel.kext），该部分以 PolyForm Noncommercial License 1.0.0 授权，
+仅限非商业用途：https://polyformproject.org/licenses/noncommercial/1.0.0 。仓库只分发补丁，不分发编译出的 kext。
+
+Required Notice: Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)
+
 ## nullarc（PhxBringup）
 
 ```

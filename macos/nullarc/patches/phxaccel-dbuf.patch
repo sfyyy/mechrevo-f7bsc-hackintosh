@@ -1,0 +1,332 @@
+diff --git a/src/phxaccel/accel/nvrm-accel.cpp b/src/phxaccel/accel/nvrm-accel.cpp
+index f124ccb..50820ff 100644
+--- a/src/phxaccel/accel/nvrm-accel.cpp
++++ b/src/phxaccel/accel/nvrm-accel.cpp
+@@ -1179,6 +1179,30 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
+     nvAccelIopHome(fb, head);
++    // f7bsc patch: on PhxAMDFB with debug.phxfb_dbuf on, the frame goes into the surface that is NOT on the panel, and
++    // the framebuffer flips to it at the next vblank (no tearing). Anything else keeps the single-surface copy.
++    struct NVRMVramRequest bq;
++    for (unsigned i = 0; i < sizeof bq; i++) ((volatile unsigned char *)&bq)[i] = 0;
++    bq.version = NVRM_VRAM_ABI_VERSION;
++    bool dbuf = false;
++    const OSSymbol *symFlip = nullptr;
++    if (fb->metaCast("PhxAMDFB")) {
++        const OSSymbol *symBack = OSSymbol::withCStringNoCopy(PHX_FN_SCANOUT_BACK);
++        const IOReturn br = symBack ? fb->callPlatformFunction(symBack, false, &bq, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
++        if (symBack) symBack->release();
++        if (br == kIOReturnSuccess) {
++            symFlip = OSSymbol::withCStringNoCopy(PHX_FN_SCANOUT_FLIP);
++            const bool fits = bq.kva && bq.pitch == q.pitch && bq.width == q.width && bq.height == q.height &&
++                              !(((uintptr_t)bq.kva) & 15);
++            if (fits && symFlip) { q.kva = bq.kva; dbuf = true; }
++            else if (symFlip) fb->callPlatformFunction(symFlip, false, nullptr, nullptr, nullptr, nullptr);   // let it go
++            if (!dbuf && symFlip) { symFlip->release(); symFlip = nullptr; }
++        } else if (br == kIOReturnBusy) {
++            // the previous flip never latched: the other surface may still be on the panel, so this frame is dropped
++            // (the panel keeps the last one) rather than written over what is being scanned
++            return kIOReturnSuccess;
++        }
++    }
+     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
+     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+@@ -1239,6 +1263,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+         }
+     }
+     __asm__ __volatile__("sfence" ::: "memory");   // the frame is in DRAM before the transaction completes
++    if (dbuf) {   // the frame is complete in the back surface: point the scan-out at it (latched at the next vblank)
++        fb->callPlatformFunction(symFlip, false, &bq, nullptr, nullptr, nullptr);
++        symFlip->release();
++    }
+     fIopVblSeq = __atomic_load_n(&gPhxVblSeq, __ATOMIC_ACQUIRE);
+     {
+         uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+diff --git a/src/phxaccel/accel/phxfb.cpp b/src/phxaccel/accel/phxfb.cpp
+index ec33e66..91d5b39 100644
+--- a/src/phxaccel/accel/phxfb.cpp
++++ b/src/phxaccel/accel/phxfb.cpp
+@@ -48,8 +48,66 @@ SYSCTL_INT(_debug, OID_AUTO, phxfb_vbl_staged, CTLFLAG_RW | CTLFLAG_LOCKED, &gVb
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblN, "VBL ticks fired");
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_sum, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsSum, "microseconds the VBL ticks fired past their deadlines, summed");
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsMax, "the latest VBL tick, microseconds past its deadline (writable: 0 restarts it)");
++// Double-buffered scan-out (f7bsc patch). The display pipe used to copy every frame straight into the one surface DCN is
++// scanning, at a moment set by the software VBL tick, which has no phase relation to the panel's real vblank: the copy
++// raced the scan line and fast motion tore. With this on, the copy goes into a second surface in the carve-out and
++// HUBP0's primary address is then switched to it; DCN latches the new address at VUPDATE (in vblank), so a frame is
++// never shown half old, half new. debug.phxfb_dbuf: 0 = off (one surface, as before), 1 = on, N > 1 = on for N seconds
++// and then back to the original surface by itself (a trial that undoes itself if the panel shows garbage).
++// Everything the code assumes is read back from the display engine first (debug.phxfb_dbuf_state says which check
++// refused); any surprise turns it off and leaves the panel on the firmware's surface.
++static int gDbuf = 0;
++static int gDbufOffMb = 512;          // carve-out offset of the second surface, MiB (above the 256 MiB BAR window PhxBringup uses)
++static int gDbufState = 0;            // 1 active, 0 not tried, < 0 the check that refused (see dbufSetup)
++static int gDbufWaitMaxUs = 0;
++static SInt64 gDbufFlips, gDbufWaits, gDbufWaitTimeouts, gDbufHomes, gDbufAdopted;
++static uint64_t gDbufTrialEnd = 0;    // mach_absolute_time at which a trial (gDbuf > 1) ends
++static volatile SInt32 gDbufGen = 0;  // bumped by every write of debug.phxfb_dbuf: a refused setup is tried again
++static int phxfb_dbuf_sysctl SYSCTL_HANDLER_ARGS
++{
++    int v = gDbuf;
++    int err = sysctl_handle_int(oidp, &v, 0, req);
++    if (err || !req->newptr) return err;
++    if (v < 0) return EINVAL;
++    if (v > 1) {
++        uint64_t d = 0; clock_interval_to_deadline((uint32_t)(v > 3600 ? 3600 : v), kSecondScale, &d);
++        gDbufTrialEnd = d;
++    } else gDbufTrialEnd = 0;
++    gDbuf = v;
++    OSIncrementAtomic(&gDbufGen);
++    return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, phxfb_dbuf, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, phxfb_dbuf_sysctl, "I",
++            "double-buffered scan-out: 0 off, 1 on, N>1 on for N seconds then back to one surface");
++SYSCTL_INT(_debug, OID_AUTO, phxfb_dbuf_off_mb, CTLFLAG_RW | CTLFLAG_LOCKED, &gDbufOffMb, 0,
++           "carve-out offset of the second scan-out surface in MiB (read when double buffering starts)");
++SYSCTL_INT(_debug, OID_AUTO, phxfb_dbuf_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufState, 0,
++           "1 active, 0 not started, <0 refused: -1 no MMIO, -2 no carve-out info/alias, -3 HUBP address, -4 pitch, -5 FB window, "
++           "-6 system aperture, -7 map, -8 update lock, -9 carve-out too small, -10 HUBP reprogrammed by someone else, -11 tiled");
++SYSCTL_INT(_debug, OID_AUTO, phxfb_dbuf_wait_max_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gDbufWaitMaxUs, 0,
++           "longest wait for the previous flip to latch, us");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_dbuf_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufFlips, "frames flipped to the panel");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_dbuf_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufWaits, "frames that waited for the previous flip to latch");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_dbuf_wait_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufWaitTimeouts, "waits that gave up (frame dropped)");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_dbuf_homes, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufHomes, "returns to the firmware's surface");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_dbuf_adopted, CTLFLAG_RD | CTLFLAG_LOCKED, &gDbufAdopted, "times HUBP was found on the other surface and followed");
++
+ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_vbl_staged, &sysctl__debug_phxfb_vbl_n,
+-                                              &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max };
++                                              &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max,
++                                              &sysctl__debug_phxfb_dbuf, &sysctl__debug_phxfb_dbuf_off_mb, &sysctl__debug_phxfb_dbuf_state,
++                                              &sysctl__debug_phxfb_dbuf_wait_max_us, &sysctl__debug_phxfb_dbuf_flips,
++                                              &sysctl__debug_phxfb_dbuf_waits, &sysctl__debug_phxfb_dbuf_wait_timeouts,
++                                              &sysctl__debug_phxfb_dbuf_homes, &sysctl__debug_phxfb_dbuf_adopted };
++
++// a frame copy with non-temporal stores: the carve-out views come out write-back, and plain stores left frames in the
++// CPU cache while DCN read stale DRAM (the stripes of 2026-10-20). Both sides 8-byte aligned, bytes a multiple of 8.
++static void phxNtCopy(void *dst, const void *src, uint64_t bytes)
++{
++    const volatile uint64_t *s = (const volatile uint64_t *)src;
++    uint64_t *d = (uint64_t *)dst;
++    for (uint64_t i = 0, n = bytes / 8; i < n; i++) __asm__ __volatile__("movnti %1, %0" : "=m"(d[i]) : "r"((uint64_t)s[i]));
++    __asm__ __volatile__("sfence" ::: "memory");
++}
+ 
+ // The panel's backlight is the display block's PWM (DCN 3.1.4 PWRSEQ0, segment 2 base 0x34c0): ACPI's _BCM only asks the
+ // GPU driver through ATIF (AFN7), and the firmware leaves the PWM on at full duty (period 4000, 12 bits). It is set as
+@@ -502,7 +560,176 @@ public:
+         fAliasBusy = 0;
+         return fAliasMap;
+     }
++
++    // ---- double-buffered scan-out (see debug.phxfb_dbuf) ----
++    // DCN 3.1.4 registers, dword index in BAR5 (segment 2 base 0x34c0; Linux dcn_3_1_4_offset.h / sh_mask.h)
++    enum : uint32_t {
++        kSeg2 = 0x34c0,
++        kHubpTiling = kSeg2 + 0x05e7,        // HUBP0_DCSURF_TILING_CONFIG, SW_MODE 4:0 (0 = linear)
++        kHubpPitch = kSeg2 + 0x0607,         // HUBPREQ0_DCSURF_SURFACE_PITCH, PITCH 13:0 (pixels)
++        kHubpAddrLo = kSeg2 + 0x060a,        // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS (the write that arms the flip)
++        kHubpAddrHi = kSeg2 + 0x060b,        // ..._HIGH, 15:0
++        kHubpFlipCtl = kSeg2 + 0x061b,       // HUBPREQ0_DCSURF_FLIP_CONTROL: 0 UPDATE_LOCK, 1 FLIP_TYPE (1 = immediate), 8 FLIP_PENDING
++        kHubpInuseLo = kSeg2 + 0x0621, kHubpInuseHi = kSeg2 + 0x0622,   // the address DCN is reading now
++        kHubpSysLo = kSeg2 + 0x0635, kHubpSysHi = kSeg2 + 0x0636,       // HUBPREQ0 system aperture, 256 KiB units
++        kVmFbBase = kSeg2 + 0x0475, kVmFbTop = kSeg2 + 0x0476,          // DCN_VM_FB_LOCATION_BASE/TOP, 16 MiB units
++    };
++    IOLock *fDbufLock = nullptr;
++    IOMemoryMap *fBackMap = nullptr;   // the second surface: carve-out system-RAM view, written with non-temporal stores
++    uint64_t fMc[2] = { 0, 0 };        // DCN addresses of surface 0 (the firmware's) and surface 1
++    void *fKvaBuf[2] = { nullptr, nullptr };
++    uint64_t fFrameBytes = 0;
++    unsigned fFront = 0;               // the surface HUBP0 was last pointed at
++    bool fDbufOn = false, fDbufHeld = false;
++    SInt32 fDbufGenSeen = -1;
++
++    uint32_t mmio(uint32_t i) { return ((volatile uint32_t *)fMmio->getVirtualAddress())[i]; }
++    void mmioW(uint32_t i, uint32_t v) { ((volatile uint32_t *)fMmio->getVirtualAddress())[i] = v; }
++    uint64_t hubpAddr() { return ((uint64_t)(mmio(kHubpAddrHi) & 0xffff) << 32) | mmio(kHubpAddrLo); }
++    bool flipPending() { return (mmio(kHubpFlipCtl) & 0x100u) != 0; }
++    uint64_t childProp(const char *name) {
++        uint64_t v = 0;
++        if (OSIterator *it = fPCI->getChildIterator(gIOServicePlane)) {
++            while (OSObject *o = it->getNextObject()) {
++                IORegistryEntry *e = OSDynamicCast(IORegistryEntry, o);
++                OSNumber *n = e ? OSDynamicCast(OSNumber, e->getProperty(name)) : nullptr;
++                if (n) { v = n->unsigned64BitValue(); break; }
++            }
++            it->release();
++        }
++        return v;
++    }
++    // waits for the last flip to latch; false when it did not within ~2.5 refreshes
++    bool waitFlipLatched() {
++        if (!flipPending()) return true;
++        const uint64_t t0 = mach_absolute_time();
++        uint64_t limit; nanoseconds_to_absolutetime(fFrameNs * 5 / 2, &limit);
++        bool ok = false;
++        while (mach_absolute_time() - t0 < limit) { if (!flipPending()) { ok = true; break; } IODelay(20); }
++        uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++        if ((int)(ns / 1000) > gDbufWaitMaxUs) gDbufWaitMaxUs = (int)(ns / 1000);
++        OSAddAtomic64(1, ok ? &gDbufWaits : &gDbufWaitTimeouts);
++        return ok;
++    }
++    void hubpPoint(unsigned idx) {
++        uint32_t fc = mmio(kHubpFlipCtl);
++        if (fc & 0x2u) mmioW(kHubpFlipCtl, fc & ~0x2u);   // flip at VUPDATE, never immediately (an immediate flip tears)
++        mmioW(kHubpAddrHi, (uint32_t)(fMc[idx] >> 32) & 0xffff);   // high first: the low write arms the flip (hubp2_program_surface_flip_and_addr)
++        mmioW(kHubpAddrLo, (uint32_t)fMc[idx]);
++        fFront = idx;
++    }
++    // lock held. Back to the firmware's surface with the newest frame in it, so a reader of the aperture (or the
++    // module going away) sees what the panel showed.
++    void dbufHome(const char *why) {
++        if (!fDbufOn) return;
++        fDbufOn = false;
++        if (fMmio && fFront != 0 && hubpAddr() == fMc[1]) {
++            waitFlipLatched();
++            phxNtCopy(fKvaBuf[0], fKvaBuf[1], fFrameBytes);
++            hubpPoint(0);
++            waitFlipLatched();
++        }
++        fFront = 0;
++        OSAddAtomic64(1, &gDbufHomes);
++        if (gDbufState == 1) gDbufState = 0;
++        PFBLOG("dbuf: back on the firmware's surface (%s)", why);
++    }
++    void dbufRefuse(int state, const char *fmt, uint64_t a, uint64_t b) {
++        gDbufState = state;
++        PFBLOG("dbuf: refused (%d): %s 0x%llx 0x%llx", state, fmt, (unsigned long long)a, (unsigned long long)b);
++    }
++    // lock held. Checks everything against the running display engine, then maps the second surface.
++    bool dbufSetup() {
++        if (!fMmio || fMmio->getLength() < (uint64_t)(kHubpSysHi + 1) * 4) { dbufRefuse(-1, "no BAR5 view", 0, 0); return false; }
++        IOMemoryMap *alias = gAlias ? aliasMap() : nullptr;
++        const uint64_t fbPhys = childProp("phx-fb-phys"), fbSize = childProp("phx-fb-size"), mcBase = childProp("phx-fb-mc-base"),
++                       aperLen = childProp("phx-fb-aper-len");
++        if (!alias || !fbPhys || !fbSize || !mcBase || !aperLen) { dbufRefuse(-2, "carve-out phys/size or the alias view missing", fbPhys, fbSize); return false; }
++        uint64_t barOff = ~0ull;
++        for (uint32_t i = 0; i < fPCI->getDeviceMemoryCount(); i++) {
++            IODeviceMemory *dm = fPCI->getDeviceMemoryWithIndex(i);
++            if (dm && fBase >= dm->getPhysicalAddress() && fBase - dm->getPhysicalAddress() < dm->getLength()) { barOff = fBase - dm->getPhysicalAddress(); break; }
++        }
++        const uint64_t cur = hubpAddr();
++        if (barOff == ~0ull || cur != mcBase + barOff) { dbufRefuse(-3, "HUBP0 scans out / expected", cur, mcBase + barOff); return false; }
++        { const uint32_t p = mmio(kHubpPitch) & 0x3fff;   // Linux writes pixels - 1 (hubp2_program_size)
++        if ((p + 1 != fRowBytes / 4 && p != fRowBytes / 4) || (fRowBytes & 3)) { dbufRefuse(-4, "HUBP0 pitch / row pixels", mmio(kHubpPitch) & 0x3fff, fRowBytes / 4); return false; } }
++        if (mmio(kHubpTiling) & 0x1f) { dbufRefuse(-11, "HUBP0 surface is not linear, SW_MODE", mmio(kHubpTiling) & 0x1f, 0); return false; }
++        if (mmio(kHubpFlipCtl) & 0x1u) { dbufRefuse(-8, "SURFACE_UPDATE_LOCK is held, FLIP_CONTROL", mmio(kHubpFlipCtl), 0); return false; }
++        const uint64_t bytes = round_page_64((uint64_t)fRowBytes * fHeight);
++        const uint64_t off = ((uint64_t)(gDbufOffMb > 0 ? gDbufOffMb : 512) << 20);
++        if (off < aperLen || off < barOff + bytes || off + bytes > fbSize) { dbufRefuse(-9, "second surface offset / carve-out size", off, fbSize); return false; }
++        const uint64_t mc1 = mcBase + off;
++        const uint64_t fbLo = (uint64_t)(mmio(kVmFbBase) & 0xffffff) << 24, fbHi = ((uint64_t)(mmio(kVmFbTop) & 0xffffff) << 24) | 0xffffff;
++        if (cur < fbLo || cur + bytes - 1 > fbHi || mc1 < fbLo || mc1 + bytes - 1 > fbHi) { dbufRefuse(-5, "outside DCN's FB window", fbLo, fbHi); return false; }
++        const uint64_t sLo = (uint64_t)(mmio(kHubpSysLo) & 0x3fffffff) << 18, sHi = ((uint64_t)(mmio(kHubpSysHi) & 0x3fffffff) << 18) | 0x3ffff;
++        const bool curSys = cur >= sLo && cur + bytes - 1 <= sHi, newSys = mc1 >= sLo && mc1 + bytes - 1 <= sHi;
++        if (curSys != newSys) { dbufRefuse(-6, "system aperture covers one surface only", sLo, sHi); return false; }
++        if (!fBackMap) {
++            if (IODeviceMemory *dm = IODeviceMemory::withRange(fbPhys + off, bytes)) { fBackMap = dm->map(kIOMapWriteCombineCache); dm->release(); }
++            if (!fBackMap) { dbufRefuse(-7, "second surface would not map at", fbPhys + off, bytes); return false; }
++        }
++        fMc[0] = cur; fMc[1] = mc1; fFrameBytes = bytes;
++        fKvaBuf[0] = (void *)alias->getVirtualAddress(); fKvaBuf[1] = (void *)fBackMap->getVirtualAddress();
++        phxNtCopy(fKvaBuf[1], fKvaBuf[0], bytes);   // the first flip shows the picture already on the panel
++        fFront = 0; fDbufOn = true; gDbufState = 1;
++        PFBLOG("dbuf: on: surface 0 at DCN 0x%llx, surface 1 at DCN 0x%llx (carve-out +0x%llx, phys 0x%llx), %llu bytes, FB window 0x%llx-0x%llx",
++               (unsigned long long)fMc[0], (unsigned long long)fMc[1], (unsigned long long)off, (unsigned long long)(fbPhys + off),
++               (unsigned long long)bytes, (unsigned long long)fbLo, (unsigned long long)fbHi);
++        return true;
++    }
++    // The display pipe asks for the surface to copy the next frame into. On success the lock stays held until
++    // phxScanoutFlip (with the request, to show it; with NULL, to abandon it).
++    IOReturn dbufBack(NVRMVramRequest *r) {
++        if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++        if (!fDbufLock || fStopping) return kIOReturnUnsupported;
++        if (!gDbuf && !fDbufOn) return kIOReturnUnsupported;   // the common off case: no lock, no register reads
++        IOLockLock(fDbufLock);
++        const SInt32 gen = gDbufGen;
++        if (gDbuf > 1 && gDbufTrialEnd && mach_absolute_time() > gDbufTrialEnd) { gDbuf = 0; gDbufTrialEnd = 0; PFBLOG("dbuf: trial over"); }
++        if (!gDbuf) { dbufHome("debug.phxfb_dbuf=0"); IOLockUnlock(fDbufLock); return kIOReturnUnsupported; }
++        if (!fDbufOn) {
++            if (gDbufState < 0 && gen == fDbufGenSeen) { IOLockUnlock(fDbufLock); return kIOReturnUnsupported; }   // refused: wait for a new sysctl write
++            fDbufGenSeen = gen;
++            if (!dbufSetup()) { IOLockUnlock(fDbufLock); return kIOReturnUnsupported; }
++        }
++        // the panel must still be scanning one of ours. After a display sleep or anything else that re-programs HUBP0,
++        // follow it when it points at one of the two; otherwise let go and touch nothing.
++        const uint64_t cur = hubpAddr();
++        if (cur != fMc[fFront]) {
++            if (cur == fMc[0] || cur == fMc[1]) { fFront = cur == fMc[1] ? 1 : 0; OSAddAtomic64(1, &gDbufAdopted); }
++            else { fDbufOn = false; dbufRefuse(-10, "HUBP0 re-programmed, scans out / ours", cur, fMc[fFront]); IOLockUnlock(fDbufLock); return kIOReturnUnsupported; }
++        }
++        // the surface not on the panel may still be read by DCN until the previous flip has latched
++        if (!waitFlipLatched()) { IOLockUnlock(fDbufLock); return kIOReturnBusy; }
++        const unsigned back = fFront ^ 1u;
++        r->kva = fKvaBuf[back]; r->phys = 0; r->actualSize = fFrameBytes;
++        r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes; r->flags = back;
++        fDbufHeld = true;
++        return kIOReturnSuccess;   // lock held
++    }
++    IOReturn dbufFlip(NVRMVramRequest *r) {
++        if (!fDbufLock || !fDbufHeld) return kIOReturnNotPermitted;
++        fDbufHeld = false;
++        if (r && r->version == NVRM_VRAM_ABI_VERSION && fDbufOn && r->flags < 2 && r->flags != fFront) {
++            __asm__ __volatile__("sfence" ::: "memory");
++            hubpPoint(r->flags);
++            OSAddAtomic64(1, &gDbufFlips);
++        }
++        IOLockUnlock(fDbufLock);
++        return kIOReturnSuccess;
++    }
++    void dbufStop() {
++        if (!fDbufLock) return;
++        IOLockLock(fDbufLock);
++        dbufHome("stop");
++        OSSafeReleaseNULL(fBackMap);
++        IOLockUnlock(fDbufLock);
++    }
++
+     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override {
++        if (fn && fn->isEqualTo(PHX_FN_SCANOUT_BACK)) return dbufBack((NVRMVramRequest *)p1);
++        if (fn && fn->isEqualTo(PHX_FN_SCANOUT_FLIP)) return dbufFlip((NVRMVramRequest *)p1);
+         if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
+             NVRMVramRequest *r = (NVRMVramRequest *)p1;
+             if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+@@ -680,6 +907,7 @@ bool PhxAMDFB::start(IOService *provider)
+     setProperty("IOFBDependentIndex", 0ull, 32);
+     // the backlight's handler comes first: IOGraphics checks for a "backlight" service once, when the framebuffer opens
+     fMmio = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
++    fDbufLock = IOLockAlloc();
+     if (fMmio && fMmio->getLength() < (kBlLock + kBlSeqs[1] + 1) * 4) OSSafeReleaseNULL(fMmio);
+     uint32_t bl = 0;
+     if (PE_parse_boot_argn("-phxbloff", arg, sizeof arg)) PFBLOG("backlight: -phxbloff, no brightness control");
+@@ -720,6 +948,7 @@ bool PhxAMDFB::start(IOService *provider)
+ void PhxAMDFB::stop(IOService *provider)
+ {
+     fStopping = true;
++    dbufStop();   // the panel back on the firmware's surface before its mappings go
+     phxAgdcRemove();
+     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+     if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }
+@@ -730,5 +959,6 @@ void PhxAMDFB::stop(IOService *provider)
+     OSSafeReleaseNULL(fSurfMap);
+     OSSafeReleaseNULL(fVa);
+     poolFree();
++    if (fDbufLock) { IOLockFree(fDbufLock); fDbufLock = nullptr; }
+     IOFramebuffer::stop(provider);
+ }
+diff --git a/src/phxaccel/nvrm_vram_abi.h b/src/phxaccel/nvrm_vram_abi.h
+index 430fcb4..e84cc81 100644
+--- a/src/phxaccel/nvrm_vram_abi.h
++++ b/src/phxaccel/nvrm_vram_abi.h
+@@ -26,3 +26,9 @@ struct NVRMVramRequest {
+     unsigned int width, height, pitch;
+     unsigned long long allocationCookie;
+ };
++
++/* f7bsc patch: double-buffered scan-out on PhxAMDFB (phxfb.cpp, debug.phxfb_dbuf). BACK takes an NVRMVramRequest and
++ * answers the surface to copy the next frame into (flags = its index); FLIP with that request shows it, FLIP with NULL
++ * abandons it. Anything but success from BACK: copy into nvScanoutInfo's surface as before. */
++#define PHX_FN_SCANOUT_BACK   "phxScanoutBack"
++#define PHX_FN_SCANOUT_FLIP   "phxScanoutFlip"
