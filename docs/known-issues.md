@@ -30,6 +30,14 @@ update lock），任何一项不符就保持原来的单缓冲。
   `NVMTL_WS_WAIT_COMPLETION=1`，让 WindowServer 自己等每次合成完成。`macos/display/install.sh` 两项都做。
 - 代价：WindowServer 每帧多等一次 GPU，帧率可能略低。
 
+## 锁屏动画少量撕裂、局部花屏（未解决）
+
+锁屏 / 解锁的过渡动画中偶尔出现横向断层或局部花块，动画结束后恢复。`debug.phxfb_dbuf` 开、关都会出现，
+`debug.nvaccel_surface_gpu_on=0` 也不能消除，所以与双缓冲和 B-58 的绕过无关。
+
+推测：锁屏画面由 loginwindow 等其他进程用 Metal 渲染，WindowServer 合成时没有等这些进程的 GPU 工作完成
+（nullarc 没有跨进程的 IOSurface 同步），采到了画到一半的内容。尚未验证。
+
 ## 核显空闲时仍"忙碌"（nullarc#14）
 
 `GRBM_STATUS = 0xa800302c`（`macos/check.sh` 会显示）。nullarc 0.4.0 的 mesboot 没有设置 `CP_MEC_DOORBELL_RANGE`，
