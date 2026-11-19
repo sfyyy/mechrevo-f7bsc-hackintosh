@@ -5,7 +5,8 @@
 // without putting an untested plugin in WindowServer.
 //   usage: carender [frames=600] [layers=40] [surfaces-per-layer=4] [check-every=1, 0 = no readback]
 // Exit 0 = every checked pixel right. CARENDER_ALPHA=1 makes every third layer 60% opaque (blending; those are not
-// checked); CARENDER_DUMP=N writes frame N as raw BGRA to /tmp/carender.bgra, to compare two plugin builds byte for byte.
+// checked); CARENDER_IMAGES=N gives every Nth layer a NEW CGImage each frame instead of a surface (CA uploads it with
+// newTiledTextureWithBytesNoCopy; odd row pitches take the plugin's buffer-texture stand-in path); CARENDER_DUMP=N writes frame N as raw BGRA to /tmp/carender.bgra, to compare two plugin builds byte for byte.
 // Run against an uninstalled build with runp.sh (DYLD shim), never by installing it first.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -15,6 +16,19 @@
 
 #define W 1280
 #define H 800
+
+static uint32_t imgcol(int i, int f)
+{
+    uint32_t h = (uint32_t)(i * 2654435761u) ^ (uint32_t)(f * 40503u); h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return 0xff000000u | ((40 + (h & 255) % 200) << 16) | ((40 + ((h >> 8) & 255) % 200) << 8) | (40 + ((h >> 16) & 255) % 200);
+}
+static CGImageRef mkimage(int w, int h, uint32_t bgra, CGColorSpaceRef cs)
+{
+    CGContextRef c = CGBitmapContextCreate(NULL, w, h, 8, 0, cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    uint8_t *b = CGBitmapContextGetData(c); size_t rb = CGBitmapContextGetBytesPerRow(c);
+    for (int y = 0; y < h; y++) { uint32_t *r = (uint32_t *)(b + y * rb); for (int x = 0; x < w; x++) r[x] = bgra; }
+    CGImageRef im = CGBitmapContextCreateImage(c); CGContextRelease(c); return im;
+}
 
 static IOSurfaceRef mksurf(int w, int h, uint32_t bgra)
 {
@@ -38,6 +52,8 @@ int main(int argc, char **argv)
     @autoreleasepool {
         int frames = argc > 1 ? atoi(argv[1]) : 600, nl = argc > 2 ? atoi(argv[2]) : 40, ns = argc > 3 ? atoi(argv[3]) : 4;
         int every = argc > 4 ? atoi(argv[4]) : 1;
+        const int nimg = getenv("CARENDER_IMAGES") ? atoi(getenv("CARENDER_IMAGES")) : 0;
+        uint64_t worst_ns = 0;
         if (nl > 256) nl = 256;
         if (ns > 8) ns = 8;
         id<MTLDevice> d = MTLCreateSystemDefaultDevice();
@@ -80,7 +96,10 @@ int main(int argc, char **argv)
                 // a grid that shifts a little each frame; layers never overlap so every centre is that layer's colour
                 const int cx = 40 + (i % cols) * 78 + (f % 7), cy = 50 + (i / cols) * 110 + (f % 5);
                 L[i].position = CGPointMake(cx, cy);
-                L[i].contents = (__bridge id)S[i][(f + i) % ns];
+                if (nimg > 0 && i % nimg == 0) {
+                    const int w = lw[i & 3], h = lh[i & 3];
+                    CGImageRef im = mkimage(w, h, imgcol(i, f), cs); L[i].contents = (__bridge id)im; CGImageRelease(im);
+                } else L[i].contents = (__bridge id)S[i][(f + i) % ns];
                 L[i].opacity = getenv("CARENDER_ALPHA") && (i % 3) == 0 ? 0.6f : 1.0f;   // translucent: blended over the background
             }
             [CATransaction commit]; [CATransaction flush];
@@ -90,7 +109,7 @@ int main(int argc, char **argv)
             if (f == 0) { CGRect ub = [r updateBounds]; printf("updateBounds %.0f,%.0f %.0fx%.0f\n", ub.origin.x, ub.origin.y, ub.size.width, ub.size.height); }
             [r render];
             [r endFrame];
-            render_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - a;
+            { const uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - a; render_ns += dt; if (f && dt > worst_ns) worst_ns = dt; }
             if (every <= 0 || (f % every)) continue;
             id<MTLCommandBuffer> cb = [q commandBuffer];
             id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
@@ -105,7 +124,7 @@ int main(int argc, char **argv)
             for (int i = 0; i < nl; i++) {
                 const int cx = 40 + (i % cols) * 78 + (f % 7), cy = 50 + (i / cols) * 110 + (f % 5);
                 if (cx >= W || cy >= H || (getenv("CARENDER_ALPHA") && (i % 3) == 0)) continue;   // translucent: compare dumps instead
-                const uint32_t got = px[cy * W + cx], want = C[i][(f + i) % ns];
+                const uint32_t got = px[cy * W + cx], want = nimg > 0 && i % nimg == 0 ? imgcol(i, f) : C[i][(f + i) % ns];
                 int ok = 1;
                 for (int s = 0; s < 24; s += 8) { int dg = (int)((got >> s) & 255) - (int)((want >> s) & 255); if (dg < -3 || dg > 3) ok = 0; }
                 checked++;
@@ -113,8 +132,8 @@ int main(int argc, char **argv)
             }
         }
         uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        printf("RESULT %s %d frames x %d layers x %d surfaces: %.3f ms/frame wall, %.3f ms/frame in CARenderer, %d pixels checked, %d wrong\n",
-               bad ? "FAIL" : "PASS", frames, nl, ns, (double)(t1 - t0) / 1e6 / frames, (double)render_ns / 1e6 / frames, checked, bad);
+        printf("RESULT %s %d frames x %d layers x %d surfaces (images every %d): %.3f ms/frame wall, %.3f ms/frame in CARenderer (worst %.1f), %d pixels checked, %d wrong\n",
+               bad ? "FAIL" : "PASS", frames, nl, ns, nimg, (double)(t1 - t0) / 1e6 / frames, (double)render_ns / 1e6 / frames, (double)worst_ns / 1e6, checked, bad);
         return bad ? 1 : 0;
     }
 }

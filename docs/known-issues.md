@@ -306,6 +306,37 @@ PhxAMDFB 返回 `kIODetailedTimingValid`，总尺寸 2720×1481，像素时钟 =
 
 排查工具：`defaults write com.apple.corevideo cv_note -int 5` 打开 CoreVideo 日志（`log stream` 子系统 `com.apple.corevideo`）。
 
+## 每隔几秒一次 100–130 ms 的卡顿（已修复：`patches/nvmtl-defer-buftex.patch`，2026-11-19 已装入 WindowServer）
+
+67 ms 修好以后，Chrome 自己报告 60 fps、0 卡顿，但肉眼仍能看到每隔 2–5 秒顿一下。`perf/stall.c`（每 0.25 ms 读
+PhxAMDFB 的翻页计数 `debug.phxfb_dbuf_flips`）显示 WindowServer 每隔 2–5 秒有 6–8 帧（100–130 ms）不翻页，70 秒 14 次。
+
+- 不是 GPU 卡住：`perf/gpuping.m` 同时每 4 ms 提交一个小任务，最慢 8 ms。
+- 不是防残影的 `NVMTL_WS_WAIT_COMPLETION`（它在停顿里只占很小一部分，这次没有动）。
+- `perf/wsblock.d`（`sudo dtrace -p WindowServer`：阻塞 > 30 ms 的调用栈 + 199 Hz 采样）：停顿时渲染线程在
+  CoreAnimation 上传图层图片（`bind_image → copy_image_to_texture → newTiledTextureWithBytesNoCopy`）。CA 给的偏移是
+  32 字节，不能直接映射，插件给每张图建一个私有替身图像（`_bufCopy`），并在 `setFragmentTexture:` 里**提交复制并等 GPU
+  做完**。一帧里几十张新图（菜单、窗口内容刷新）就是几十次“提交 + 等待”。
+
+修复：替身图像的填充和 surface-in 一样，记进下一次提交的开头（prologue），不再单独提交、单独等待。
+开关 `NVMTL_DEFER_BUFTEX=0` 恢复旧行为。
+
+测试（应用进程，`tests/runp.sh`）：`CARENDER_IMAGES=1 carender 300 40 4`（每帧 40 张新图）CARenderer 每帧
+10.1 → 3.7 ms，最慢 14–17 → 7 ms；3000 帧 × 120 层 0 错误像素；半透明画面与旧插件逐字节一致；surftest、desctest、
+descsurfdraw、descdrawstress 通过。
+
+WindowServer 验收（装好重启后，`perf/stall.c` + bench2 页面）：
+
+| | 修复前（70 s） | 修复后（70 s） |
+|---|---|---|
+| ≥ 6 帧（≥ 100 ms）不翻页 | 14 次，周期性 | 稳定段 0 次（只在 Chrome 启动的头 2 秒） |
+| 2 帧间隔 | 430 | 24 |
+
+剩余开销：每张新图仍要新建 GPU 内存（导入页面、建图像、分配显存地址），测试里约占渲染时间一半；下一步可做替身图像复用。
+另有一种整机停顿（所有用户线程同时停 30–60 ms，内核 VBL 定时器照常），原因未查，AirportItlwm 扫描是嫌疑之一。
+
+安装：`sudo bash work/install-buftex.sh` 后重启；回滚 `rollback-buftex.sh`；WindowServer 崩溃时 `recover-buftex.sh`。
+
 ## kernel_task 空闲时占 30–40% CPU（已缓解：`xhcinudge=1` → `4`）
 
 屏幕静止、没有任何操作时，`kernel_task` 持续占 28–43%。

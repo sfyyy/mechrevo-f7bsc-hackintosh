@@ -1,0 +1,124 @@
+--- a/src/nmplugin/NVMTLObjects.m
++++ b/src/nmplugin/NVMTLObjects.m
+@@ -696,6 +696,20 @@
+ static _Atomic int gSurfInAny;
+ static __thread int gSurfInInFlush;
+ static _Atomic unsigned long long gSurfInDeferred, gSurfInPrologue, gSurfInSyncFallback, gSurfInLastCensus;
++static _Atomic unsigned long long gBufTexDeferred, gBufTexPrologue, gBufTexSyncFallback;
++// Deferred buffer-texture refill (2026-11-19, NVMTL_DEFER_BUFTEX, default ON; =0 restores the copy-and-wait at bind time).
++// WAS: CoreAnimation uploads a layer's image contents with newTiledTextureWithBytesNoCopy; rows that are not a multiple of
++// 256 bytes (text lines, icons, glyph masks) get a private stand-in image (_bufCopy), and its first use in
++// setFragmentTexture: submitted the buffer->image copy and waited for its fence on WindowServer's render thread. A frame
++// that brings in a few dozen new images (a window or menu redrawing) stalled 100-130 ms (dtrace 2026-11-19: render
++// thread in nvmtl_vk_submit_finish <- nvmtl_vk_image_host_xfer <- nvmtlSurfaceIn, 6-7 frames not presented).
++// Now the copy rides the surface-in queue into the next submission's prologue, like a deferred surface-in.
++static int nvmtl_defer_buftex(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_DEFER_BUFTEX"); on = !(e && e[0] == '0');
++        nvlog("buffer texture refill: %s (NVMTL_DEFER_BUFTEX=%s)", on ? "DEFERRED - copied in the next submission's prologue" : "copied and waited for at bind time (old)", e ? e : "unset"); }
++    return on;
++}
+ static void nvmtl_presubmit(void);
+ static int nvmtl_defer_surface_in(void) {
+     static int on = -1;
+@@ -704,12 +718,13 @@
+     return on;
+ }
+ static void nvmtl_surfin_census(void) {
+-    nvlog("surface-in census: %llu deferred, %llu rode a prologue, %llu copied at once (fallback)",
+-          (unsigned long long)gSurfInDeferred, (unsigned long long)gSurfInPrologue, (unsigned long long)gSurfInSyncFallback);
++    nvlog("surface-in census: %llu deferred, %llu rode a prologue, %llu copied at once (fallback); buffer textures %llu deferred, %llu rode a prologue, %llu copied at once",
++          (unsigned long long)gSurfInDeferred, (unsigned long long)gSurfInPrologue, (unsigned long long)gSurfInSyncFallback,
++          (unsigned long long)gBufTexDeferred, (unsigned long long)gBufTexPrologue, (unsigned long long)gBufTexSyncFallback);
+ }
+ // r is the backing (no parent), caller holds @synchronized(nvmtl_surface_sync(r)). Returns 1 if queued.
+ static int nvmtl_surfin_queue(NVMTLTexture *r) {
+-    if (!nvmtl_defer_surface_in()) return 0;
++    if (r->_bufCopy ? !nvmtl_defer_buftex() : !nvmtl_defer_surface_in()) return 0;
+     int queued = 0;
+     os_unfair_lock_lock(&gSurfInLock);
+     if (!gSurfInOwed) gSurfInOwed = [NSMutableArray new];
+@@ -718,7 +733,7 @@
+         atomic_store(&gSurfInAny, 1); nvmtl_pre_submit_hook = nvmtl_presubmit; queued = 1;
+     }
+     os_unfair_lock_unlock(&gSurfInLock);
+-    if (queued) gSurfInDeferred++;
++    if (queued) { if (r->_bufCopy) gBufTexDeferred++; else gSurfInDeferred++; }
+     return queued;
+ }
+ static void nvmtl_surfin_flush(void) {
+@@ -731,6 +746,15 @@
+         const int pre = nvmtl_vk_pre_open();
+         NSMutableArray *held = pre ? [NSMutableArray arrayWithCapacity:todo.count] : nil;
+         for (NVMTLTexture *r in todo) {
++            if (r->_bufCopy) {
++                if (pre && nvmtl_vk_pre_image_from_buffer(&r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR) == 0) { [held addObject:r]; gBufTexPrologue++; continue; }
++                gBufTexSyncFallback++;
++                if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 1)) {
++                    static int said; if (said++ < 4) nvlog("buffer texture copy: deferred refill FAILED (%ux%u at offset %lu) - refilled at its next use", r->_i.w, r->_i.h, (unsigned long)r->_backOff);
++                    r->_bufHashed = NO;   // no lock here, as for surface-in below: this runs under the submit mutex
++                }
++                continue;
++            }
+             if (pre && nvmtl_vk_pre_image_from_host(&r->_i, &r->_hostBuf, r->_hostRow) == 0) { [held addObject:r]; gSurfInPrologue++; continue; }
+             gSurfInSyncFallback++;
+             if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, r->_hostRow, 1)) {
+@@ -1327,6 +1351,9 @@
+         const uint64_t h = p ? nvmtl_buftex_hash(r, p) : 0;
+         if (r->_bufHashed && (!p || h == r->_bufHash)) return;   // unchanged, or only the GPU can change it
+         nvmtl_buffer_sync_in(r->_backBuf);   // a no-copy buffer whose pages were not imported is a copy: bring it up first
++        // Deferred: the copy rides the next submission's prologue, which runs before this command buffer. The layout is
++        // what the copy leaves, so the barriers encoded from here on start from it (as the synchronous copy set it).
++        if (nvmtl_surfin_queue(r)) { r->_i.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; r->_bufHash = h; r->_bufHashed = YES; return; }
+         if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 1))
+             { static int said; if (said++ < 4) nvlog("buffer texture copy: refill FAILED (%ux%u at offset %lu, bytesPerRow %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff, (unsigned long)r->_backBPR); return; }
+         r->_bufHash = h; r->_bufHashed = YES;
+--- a/src/nmplugin/nvmtl_vk.c
++++ b/src/nmplugin/nvmtl_vk.c
+@@ -5728,20 +5728,21 @@
+ // instead of being submitted and waited for at encode time (2026-11-19). Same GPU order as before: the old copy ran before
+ // any later submission, and the prologue runs before the command buffer it rides with, which is the first submission after
+ // the encode. Whole image, single level/layer, uncompressed: the caller checked the shape (nvmtl_vk_image_host_xfer's rules).
+-int nvmtl_vk_pre_image_from_host(nvk_image *img, nvk_buffer *hb, size_t row_bytes)
++// Also a buffer texture's stand-in image refilled from its buffer at offset (nvmtl_vk_pre_image_from_buffer, 2026-11-19).
++int nvmtl_vk_pre_image_from_buffer(nvk_image *img, nvk_buffer *hb, size_t offset, size_t row_bytes)
+ {
+     nvmtl_prologue *p = g_pre_cur;
+     if (!p || !p->begun || !img || !img->img || !hb || !hb->buf) return -1;
+     const size_t bpp = img->bpp ? img->bpp : 4;
+-    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w
+-        || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size) return -1;
++    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w || offset % 4 || offset % bpp
++        || offset > hb->size || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size - offset) return -1;
+     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+     pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+-    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
++    VkBufferImageCopy bic = { offset, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+     pvkCmdCopyBufferToImage(p->cb.cb, (VkBuffer)hb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+@@ -5750,6 +5751,10 @@
+     pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+     p->n++; p->copies++; p->bytes += row_bytes * img->h;
+     return 0;
++}
++int nvmtl_vk_pre_image_from_host(nvk_image *img, nvk_buffer *hb, size_t row_bytes)
++{
++    return nvmtl_vk_pre_image_from_buffer(img, hb, 0, row_bytes);
+ }
+ void nvmtl_vk_pre_hold(void *retained)
+ {
+--- a/src/nmplugin/nvmtl_vk.h
++++ b/src/nmplugin/nvmtl_vk.h
+@@ -304,6 +304,7 @@
+ // Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
+ // is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
+ int nvmtl_vk_pre_image_from_host(nvk_image *img, nvk_buffer *hb, size_t row_bytes);
++int nvmtl_vk_pre_image_from_buffer(nvk_image *img, nvk_buffer *hb, size_t offset, size_t row_bytes);
+ void nvmtl_vk_image_upload_barrier(nvk_image *img);
+ void nvmtl_vk_queue_destroy(nvk_queue *q);
+ size_t nvmtl_vk_allocated_bytes(void);
