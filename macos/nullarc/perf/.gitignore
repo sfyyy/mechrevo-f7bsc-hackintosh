@@ -1,0 +1,6 @@
+# measurement output
+*.log
+*.sample
+*.bench
+*.top
+gpu-*.txt

@@ -29,6 +29,7 @@ ACPI/               SSDT 源码（.dsl）
 linux/              部署 EFI 到 ESP 的脚本、systemd-boot 启动项
 macos/
   nullarc/          780M 驱动安装脚本（1–3 安装，4 双缓冲补丁）与 patches/
+                    tests/（复现与回归测试）、perf/（WindowServer 采样与 Chrome 基准）
   display/          开机设置：双缓冲、动画残影绕过（LaunchDaemon）
   thermal/          核显限频 800 MHz + 时钟门控（LaunchDaemon）
   check.sh          只读状态检查
@@ -84,7 +85,7 @@ sudo bash macos/nullarc/1-install.sh ~/Downloads/nullarc-0.4.0-alpha.zip   # 仅
 sudo bash macos/nullarc/2-fix-15bf.sh    # 发布包的 PhxAccel 只匹配 0x1900，改成上游的设备列表；然后重启
 sudo bash macos/nullarc/3-enable-m2.sh   # PhxFB 也匹配 15bf 并启用 M2；重启两次后桌面由 GPU 合成
 sudo bash macos/nullarc/4-dbuf.sh        # 重新编译带双缓冲补丁的 PhxAccel（修复拖动撕裂）；需要 Command Line Tools；然后重启
-sudo bash macos/display/install.sh       # 开机打开双缓冲，并绕过动画残影（nullarc B-58）
+sudo bash macos/display/install.sh       # 开机打开双缓冲，绕过动画残影（nullarc B-58）和跨进程花屏
 ```
 
 - 4-dbuf 从 GitHub 下载 nullarc v0.4.0-alpha 源码和 MacKernelSDK（固定版本，校验 sha256），打上

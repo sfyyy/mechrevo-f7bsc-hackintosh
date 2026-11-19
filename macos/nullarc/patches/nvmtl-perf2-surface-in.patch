@@ -1,0 +1,222 @@
+--- a/src/nmplugin/NVMTLDevice.m
++++ b/src/nmplugin/NVMTLDevice.m
+@@ -991,15 +991,67 @@
+     const uint64_t k[7] = { IOSurfaceGetID(surf), plane, w, h, fmt, ropt, fbo };
+     return [NSData dataWithBytes:k length:sizeof k];
+ }
++// Short grace (2026-11-19). WAS: an entry went at the next insert once only the backing held its surface. A client that
++// presents from a pool (Chrome cycles 3-4 IOSurfaces per layer) has the previous surface released by CoreAnimation every
++// frame, so the same surface came back a frame later as a miss: ~190 new backings a second for one Chrome window at
++// 60 fps (BO create + VA map + free, and a full upload for a private one), ~10% of WindowServer's CPU.
++// Now such an entry stays NVMTL_SURFACE_KEEP_MS (300) after its last use, enough for a pool to come round. HARD bounds,
++// because every backing holds kernel BO handles and the accelerator gives a process 4095 of them and 512 MB of GTT
++// (PhxBringup): at most NVMTL_SURFACE_KEEP_IDLE (32) idle entries and NVMTL_SURFACE_KEEP_MB (64) idle bytes, oldest out
++// first. The sweep runs at most every 50 ms, not on every insert. The backing retains its surface, so the ID cannot be
++// reused while the entry stands.
++static uint64_t g_skeep_hits, g_skeep_miss, g_skeep_evict, g_skeep_sweep_at, g_skeep_stat_at;
++static long nvmtl_skeep_env(const char *name, long dflt) { const char *e = getenv(name); long v = e && *e ? atol(e) : dflt; return v < 0 ? 0 : v; }
++static inline uint64_t nvmtl_skeep_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++static uint64_t nvmtl_skeep_bytes(NVMTLTexture *b) { return b->_surf ? (uint64_t)IOSurfaceGetAllocSize(b->_surf) * (b->_hostOn ? 1 : 2) : 0; }
++static void nvmtl_surface_keep_sweep(NSMutableDictionary *keep, uint64_t now, int force) {
++    static long ttl_ms = -1, max_idle, max_mb;
++    if (ttl_ms < 0) {
++        ttl_ms = nvmtl_skeep_env("NVMTL_SURFACE_KEEP_MS", 300); max_idle = nvmtl_skeep_env("NVMTL_SURFACE_KEEP_IDLE", 32);
++        max_mb = nvmtl_skeep_env("NVMTL_SURFACE_KEEP_MB", 64);
++        nvlog("surface keep: a released surface's backing stays %ld ms, at most %ld idle / %ld MB (NVMTL_SURFACE_KEEP_MS/_IDLE/_MB)", ttl_ms, max_idle, max_mb);
++    }
++    if (!force && now - g_skeep_sweep_at < 50ull * 1000000ull) return;
++    g_skeep_sweep_at = now;
++    const uint64_t ttl = (uint64_t)ttl_ms * 1000000ull, cap = (uint64_t)max_mb << 20;
++    NSMutableArray *gone = nil, *idle = nil; uint64_t idleBytes = 0;
++    for (id k in keep) {
++        NVMTLTexture *b = keep[k];
++        if (b->_surf && CFGetRetainCount(b->_surf) > 1) continue;   // the application (or CoreAnimation) still holds it
++        if (!b->_surf || now - b->_keepNs >= ttl) { [(gone ?: (gone = [NSMutableArray new])) addObject:k]; continue; }
++        [(idle ?: (idle = [NSMutableArray new])) addObject:k];
++        idleBytes += nvmtl_skeep_bytes(b);
++    }
++    if (idle && (idle.count > (NSUInteger)max_idle || idleBytes > cap)) {
++        [idle sortUsingComparator:^NSComparisonResult(id x, id y) {
++            const uint64_t a = ((NVMTLTexture *)keep[x])->_keepNs, c = ((NVMTLTexture *)keep[y])->_keepNs;
++            return a < c ? NSOrderedAscending : a > c ? NSOrderedDescending : NSOrderedSame; }];
++        NSUInteger left = idle.count;
++        for (id k in idle) {
++            if (left <= (NSUInteger)max_idle && idleBytes <= cap) break;
++            const uint64_t sz = nvmtl_skeep_bytes(keep[k]);
++            idleBytes = idleBytes > sz ? idleBytes - sz : 0; left--;
++            [(gone ?: (gone = [NSMutableArray new])) addObject:k];
++        }
++    }
++    if (gone) { g_skeep_evict += gone.count; [keep removeObjectsForKeys:gone]; }
++    if (now - g_skeep_stat_at >= 10ull * 1000000000ull) {
++        g_skeep_stat_at = now;
++        char line[256];
++        snprintf(line, sizeof line, "surface keep: %llu hits, %llu new, %llu evicted; %lu entries (%lu idle, %llu KB idle)",
++                 (unsigned long long)g_skeep_hits, (unsigned long long)g_skeep_miss, (unsigned long long)g_skeep_evict,
++                 (unsigned long)keep.count, (unsigned long)(idle.count - (gone ? MIN(gone.count, idle.count) : 0)), (unsigned long long)(idleBytes >> 10));
++        // straight to the log file: nvlog's per-call-site limiter keeps only the first 8 lines of one format
++        FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), line); fclose(f); }
++    }
++}
+ static void nvmtl_surface_keep(id dev, id key, NVMTLTexture *t) {
+     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+-    __block NSMutableArray *gone = nil;
+-    [keep enumerateKeysAndObjectsUsingBlock:^(id k, NVMTLTexture *b, BOOL *stop) {
+-        if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [(gone ?: (gone = [NSMutableArray new])) addObject:k];
+-    }];
+-    if (gone) [keep removeObjectsForKeys:gone];
++    const uint64_t now = nvmtl_skeep_now();
++    t->_keepNs = now; g_skeep_miss++;
+     keep[key] = t;
++    nvmtl_surface_keep_sweep(keep, now, 0);
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+     @synchronized(self) {
+@@ -1028,6 +1080,7 @@
+     // whether a wrapper reads it or writes it (the image is made writable).
+     // Weak entries do not pin the image after the application's last wrapper.
+     if (backing && !backing->_vramOn) {
++        backing->_keepNs = nvmtl_skeep_now(); g_skeep_hits++;
+         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+         if (alias) {
+             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+--- a/src/nmplugin/NVMTLObjects.h
++++ b/src/nmplugin/NVMTLObjects.h
+@@ -52,6 +52,7 @@
+   uint64_t _resid;
+   NSUInteger _usage;
+   NVMTLBuffer *_backBuf; NSUInteger _backOff, _backBPR;
++  uint64_t _keepNs;   // last time nvmtlNewSurfaceTexture handed out this surface backing (nvmtl_surface_keep's aging)
+ }
+ - (nvk_image *)nvi;
+ - (void *)nvview;
+--- a/src/nmplugin/NVMTLObjects.m
++++ b/src/nmplugin/NVMTLObjects.m
+@@ -685,7 +685,66 @@
+     } else if (todo.count) nvlog("zero-fill: no command buffer for %lu Private clears - they hold what VRAM held", (unsigned long)todo.count);
+     gZeroInFlush = 0;
+ }
+-static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } }
++// Deferred surface-in (2026-11-19, NVMTL_DEFER_SURFACE_IN, default ON; =0 restores the copy-and-wait at encode time).
++// WAS: a surface whose CPU side changed was copied into its private image inside setFragmentTexture: - a submission and a
++// fence wait on WindowServer's render thread for every such surface every frame, half of WindowServer's submissions.
++// Now the texture is queued here and its copy recorded into the prologue of the next submission (the one that carries the
++// command buffer being encoded, or an earlier one), held until that submission's fence. No command buffer, fence or IB of
++// its own. Bounded: at most NVMTL_SURFIN_MAX (64) waiting; past that, and when no prologue opens, the copy is made at once.
++static os_unfair_lock gSurfInLock = OS_UNFAIR_LOCK_INIT;
++static NSMutableArray *gSurfInOwed;
++static _Atomic int gSurfInAny;
++static __thread int gSurfInInFlush;
++static _Atomic unsigned long long gSurfInDeferred, gSurfInPrologue, gSurfInSyncFallback, gSurfInLastCensus;
++static void nvmtl_presubmit(void);
++static int nvmtl_defer_surface_in(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_DEFER_SURFACE_IN"); on = !(e && e[0] == '0');
++        nvlog("surface-in: %s (NVMTL_DEFER_SURFACE_IN=%s)", on ? "DEFERRED - copied in the next submission's prologue" : "copied and waited for at encode time (old)", e ? e : "unset"); }
++    return on;
++}
++static void nvmtl_surfin_census(void) {
++    nvlog("surface-in census: %llu deferred, %llu rode a prologue, %llu copied at once (fallback)",
++          (unsigned long long)gSurfInDeferred, (unsigned long long)gSurfInPrologue, (unsigned long long)gSurfInSyncFallback);
++}
++// r is the backing (no parent), caller holds @synchronized(nvmtl_surface_sync(r)). Returns 1 if queued.
++static int nvmtl_surfin_queue(NVMTLTexture *r) {
++    if (!nvmtl_defer_surface_in()) return 0;
++    int queued = 0;
++    os_unfair_lock_lock(&gSurfInLock);
++    if (!gSurfInOwed) gSurfInOwed = [NSMutableArray new];
++    if (gSurfInOwed.count < 64) {
++        if ([gSurfInOwed indexOfObjectIdenticalTo:r] == NSNotFound) [gSurfInOwed addObject:r];
++        atomic_store(&gSurfInAny, 1); nvmtl_pre_submit_hook = nvmtl_presubmit; queued = 1;
++    }
++    os_unfair_lock_unlock(&gSurfInLock);
++    if (queued) gSurfInDeferred++;
++    return queued;
++}
++static void nvmtl_surfin_flush(void) {
++    if (!atomic_load(&gSurfInAny) || gSurfInInFlush) return;
++    gSurfInInFlush = 1;
++    os_unfair_lock_lock(&gSurfInLock);
++    NSArray *todo = [gSurfInOwed copy]; [gSurfInOwed removeAllObjects]; atomic_store(&gSurfInAny, 0);
++    os_unfair_lock_unlock(&gSurfInLock);
++    if (todo.count) {
++        const int pre = nvmtl_vk_pre_open();
++        NSMutableArray *held = pre ? [NSMutableArray arrayWithCapacity:todo.count] : nil;
++        for (NVMTLTexture *r in todo) {
++            if (pre && nvmtl_vk_pre_image_from_host(&r->_i, &r->_hostBuf, r->_hostRow) == 0) { [held addObject:r]; gSurfInPrologue++; continue; }
++            gSurfInSyncFallback++;
++            if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, r->_hostRow, 1)) {
++                static int said; if (said++ < 4) nvlog("surface-in: deferred copy FAILED (%ux%u) - the image keeps its old pixels until the surface changes again", r->_i.w, r->_i.h);
++                r->_surfSynced = NO;   // no monitor here: this runs under the submit mutex, which a surface-in holding the monitor waits for
++            }
++        }
++        if (held.count) { nvmtl_pre_release_hook = nvmtl_pre_release; nvmtl_vk_pre_hold((__bridge_retained void *)held); }
++        const unsigned long long k = gSurfInDeferred;
++        if ((k >> 13) != (gSurfInLastCensus >> 13)) { gSurfInLastCensus = k; nvmtl_surfin_census(); }
++    }
++    gSurfInInFlush = 0;
++}
++static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } @autoreleasepool { nvmtl_surfin_flush(); } }
+ static int nvmtl_mzero_on(void) {
+     static int on = -1;
+     if (on < 0) { const char *e = getenv("NVMTL_MANAGED_EAGER_ZERO"); on = !(e && e[0] == '1');
+@@ -1289,6 +1348,12 @@
+     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+     int rc = -1;
++    if (r->_hostCopy && row == r->_hostRow && !r->_vramOn && nvmtl_surfin_queue(r)) {
++        IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
++        r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
++        g_surfin_copy++;
++        return;
++    }
+     if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, row, 1);
+     if (rc && base && row) rc = nvmtl_vk_image_write(r->_q, &r->_i, base, row);
+     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
+--- a/src/nmplugin/nvmtl_vk.c
++++ b/src/nmplugin/nvmtl_vk.c
+@@ -5712,6 +5712,33 @@
+     p->n++; p->fills++; p->bytes += size;
+     return 0;
+ }
++// A surface-in copy (the surface's imported pages -> its private image) recorded into the prologue of the next submission
++// instead of being submitted and waited for at encode time (2026-11-19). Same GPU order as before: the old copy ran before
++// any later submission, and the prologue runs before the command buffer it rides with, which is the first submission after
++// the encode. Whole image, single level/layer, uncompressed: the caller checked the shape (nvmtl_vk_image_host_xfer's rules).
++int nvmtl_vk_pre_image_from_host(nvk_image *img, nvk_buffer *hb, size_t row_bytes)
++{
++    nvmtl_prologue *p = g_pre_cur;
++    if (!p || !p->begun || !img || !img->img || !hb || !hb->buf) return -1;
++    const size_t bpp = img->bpp ? img->bpp : 4;
++    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w
++        || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size) return -1;
++    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
++    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
++        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
++    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
++    pvkCmdCopyBufferToImage(p->cb.cb, (VkBuffer)hb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
++    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
++        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
++    p->n++; p->copies++; p->bytes += row_bytes * img->h;
++    return 0;
++}
+ void nvmtl_vk_pre_hold(void *retained)
+ {
+     nvmtl_prologue *p = g_pre_cur;
+--- a/src/nmplugin/nvmtl_vk.h
++++ b/src/nmplugin/nvmtl_vk.h
+@@ -303,6 +303,7 @@
+ void nvmtl_vk_image_destroy(nvk_image *i);
+ // Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
+ // is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
++int nvmtl_vk_pre_image_from_host(nvk_image *img, nvk_buffer *hb, size_t row_bytes);
+ void nvmtl_vk_image_upload_barrier(nvk_image *img);
+ void nvmtl_vk_queue_destroy(nvk_queue *q);
+ size_t nvmtl_vk_allocated_bytes(void);

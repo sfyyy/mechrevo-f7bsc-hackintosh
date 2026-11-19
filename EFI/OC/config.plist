@@ -1742,7 +1742,7 @@
 				AAAAAAAAAAAAAAAAAAA=
 				</data>
 				<key>boot-args</key>
-				<string>-v keepsyms=1 debug=0x100 msgbuf=1048576 revpatch=cpuname,sbvmm ipc_control_port_options=0 alcid=11 xhcinudge=1 -nohe -btlfxallowanyaddr -amfipassbeta amfi=0x80 amfi_get_out_of_my_way=0x1 phxdebug=1 ryzenidle=1</string>
+				<string>-v keepsyms=1 debug=0x100 msgbuf=1048576 revpatch=cpuname,sbvmm ipc_control_port_options=0 alcid=11 xhcinudge=4 -nohe -btlfxallowanyaddr -amfipassbeta amfi=0x80 amfi_get_out_of_my_way=0x1 phxdebug=1 ryzenidle=1</string>
 				<key>csr-active-config</key>
 				<data>
 				fwgAAA==
