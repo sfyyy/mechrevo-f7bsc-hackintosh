@@ -1,0 +1,52 @@
+--- a/src/phxaccel/accel/phxfb.cpp
++++ b/src/phxaccel/accel/phxfb.cpp
+@@ -48,6 +48,19 @@
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblN, "VBL ticks fired");
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_sum, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsSum, "microseconds the VBL ticks fired past their deadlines, summed");
+ SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsMax, "the latest VBL tick, microseconds past its deadline (writable: 0 restarts it)");
++// Exact VBL timestamps (f7bsc patch). IOFramebuffer's VBL handler stamps vblTime/vblDelta with mach_absolute_time() at
++// the moment the tick calls it, so the tick's wake-up latency (0-200 us) went straight into vblDelta (16.51-16.82 ms
++// seen through SLSDisplayGetCurrentVBLDelta). CoreVideo takes its refresh period from that delta, and its video/host
++// time model then wandered by seconds: CVDisplayLink output hostTimes +-10 s off, which Chrome uses as its vsync
++// timebase (2026-11-19). With spin > 0 the last stage is armed spin us before the deadline and busy-waits for it, so the
++// handlers run within a microsecond or two of the vblank the tick stands for (~1.2% of one core at 60 Hz, spin 200).
++// 0 = the old staging (fire as soon as less than 50 us remain). jitter_us_max: the worst |fire - deadline| so far.
++static int gVblSpinUs = 0;   // off: exact stamps made CVDisplayLink skip MORE frames (A/B 2026-11-19)
++static SInt64 gVblJitterUsMax;
++SYSCTL_INT(_debug, OID_AUTO, phxfb_vbl_spin_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblSpinUs, 0,
++           "microseconds the VBL tick busy-waits for its deadline so handlers see exact vblank times (0 = off, max 1000)");
++SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_jitter_us_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblJitterUsMax,
++            "the worst distance of a VBL tick's handler call from its deadline, microseconds, early or late (writable: 0 restarts it)");
+ // Double-buffered scan-out (f7bsc patch). The display pipe used to copy every frame straight into the one surface DCN is
+ // scanning, at a moment set by the software VBL tick, which has no phase relation to the panel's real vblank: the copy
+ // raced the scan line and fast motion tore. With this on, the copy goes into a second surface in the carve-out and
+@@ -94,6 +107,7 @@
+ 
+ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_vbl_staged, &sysctl__debug_phxfb_vbl_n,
+                                               &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max,
++                                              &sysctl__debug_phxfb_vbl_spin_us, &sysctl__debug_phxfb_vbl_jitter_us_max,
+                                               &sysctl__debug_phxfb_dbuf, &sysctl__debug_phxfb_dbuf_off_mb, &sysctl__debug_phxfb_dbuf_state,
+                                               &sysctl__debug_phxfb_dbuf_wait_max_us, &sysctl__debug_phxfb_dbuf_flips,
+                                               &sysctl__debug_phxfb_dbuf_waits, &sysctl__debug_phxfb_dbuf_wait_timeouts,
+@@ -279,9 +293,19 @@
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         PhxAMDFB *me = (PhxAMDFB *)p0;
+         if (me->fStopping) return;
+-        const uint64_t at = mach_absolute_time(), due = me->fVblNext;
++        const uint64_t at0 = mach_absolute_time(), due = me->fVblNext;
+         uint64_t near; nanoseconds_to_absolutetime(50000, &near);
+-        if (gVblStaged && due > at + near) { thread_call_enter_delayed(me->fVblTimer, due); return; }   // an early stage
++        const int spinUs = gVblStaged ? (gVblSpinUs < 0 ? 0 : gVblSpinUs > 1000 ? 1000 : gVblSpinUs) : 0;
++        uint64_t at = at0;
++        if (spinUs) {
++            uint64_t spin; nanoseconds_to_absolutetime((uint64_t)spinUs * 1000, &spin);
++            if (due > at + spin + near) { thread_call_enter_delayed(me->fVblTimer, due - spin); return; }   // an early stage
++            while (at < due) { __builtin_ia32_pause(); at = mach_absolute_time(); }                     // the last stretch
++        } else if (gVblStaged && due > at + near) { thread_call_enter_delayed(me->fVblTimer, due); return; }   // an early stage
++        if (due) {
++            uint64_t ns; absolutetime_to_nanoseconds(at > due ? at - due : due - at, &ns);
++            if ((SInt64)(ns / 1000) > gVblJitterUsMax) gVblJitterUsMax = (SInt64)(ns / 1000);
++        }
+         if (due && at > due) {
+             uint64_t ns; absolutetime_to_nanoseconds(at - due, &ns);
+             const SInt64 us = (SInt64)(ns / 1000);

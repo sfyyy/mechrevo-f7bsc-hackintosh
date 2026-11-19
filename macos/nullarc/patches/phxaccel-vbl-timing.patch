@@ -1,0 +1,80 @@
+--- a/src/phxaccel/accel/phxfb.cpp
++++ b/src/phxaccel/accel/phxfb.cpp
+@@ -55,6 +55,9 @@
+ // timebase (2026-11-19). With spin > 0 the last stage is armed spin us before the deadline and busy-waits for it, so the
+ // handlers run within a microsecond or two of the vblank the tick stands for (~1.2% of one core at 60 Hz, spin 200).
+ // 0 = the old staging (fire as soon as less than 50 us remain). jitter_us_max: the worst |fire - deadline| so far.
++static int gTiming = 1;
++SYSCTL_INT(_debug, OID_AUTO, phxfb_timing, CTLFLAG_RW | CTLFLAG_LOCKED, &gTiming, 0,
++           "1 = the mode reports detailed timing (fixed VBL interval for IOFramebuffer/CoreVideo), 0 = none; read at display setup");
+ static int gVblSpinUs = 0;   // off: exact stamps made CVDisplayLink skip MORE frames (A/B 2026-11-19, 890 vs 687-777 callbacks/15 s)
+ static SInt64 gVblJitterUsMax;
+ SYSCTL_INT(_debug, OID_AUTO, phxfb_vbl_spin_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblSpinUs, 0,
+@@ -107,7 +110,7 @@
+ 
+ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_vbl_staged, &sysctl__debug_phxfb_vbl_n,
+                                               &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max,
+-                                              &sysctl__debug_phxfb_vbl_spin_us, &sysctl__debug_phxfb_vbl_jitter_us_max,
++                                              &sysctl__debug_phxfb_vbl_spin_us, &sysctl__debug_phxfb_vbl_jitter_us_max, &sysctl__debug_phxfb_timing,
+                                               &sysctl__debug_phxfb_dbuf, &sysctl__debug_phxfb_dbuf_off_mb, &sysctl__debug_phxfb_dbuf_state,
+                                               &sysctl__debug_phxfb_dbuf_wait_max_us, &sysctl__debug_phxfb_dbuf_flips,
+                                               &sysctl__debug_phxfb_dbuf_waits, &sysctl__debug_phxfb_dbuf_wait_timeouts,
+@@ -162,6 +165,7 @@
+     static constexpr uint64_t kFrameNs = 16666667ull;   // 60 Hz, when the refresh cannot be measured
+     uint64_t fFrameNs = kFrameNs;
+     uint32_t fRefreshMilliHz = 60000, fHTotal = 0, fVTotal = 0;
++    bool fTimingLogged = false;
+     static constexpr unsigned kBootHoldSec = 120;   // the boot daemon releases it sooner (debug.phxfb_hold=0)
+     // The accelerator is NullMoth's, written against an NVIDIA RM: it backs each IOAccel surface with "VRAM" from the
+     // framebuffer (nvAllocVram) and a GPU address from the RM (nvGpuVaAlloc/Map). On the 780M nothing on the GPU reads
+@@ -455,10 +459,32 @@
+     IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
+     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
+     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
++    // Detailed timing (f7bsc patch, 2026-11-19). Without it IOFramebuffer's VBL handler publishes the measured interval
++    // between our soft ticks as vblDelta (16.5-16.8 ms with tick latency), WindowServer hands that to CoreVideo
++    // (SLSDisplayGetCurrentVBLDelta), and CVDisplayLink re-reads it as its period before every callback. Its video time
++    // is an absolute frame count (~uptime / period) times that period, so a 0.5% wobble put CVDisplayLink's output
++    // times seconds off; whenever the error landed within 4 periods it believed it and slept 2-4 frames (the 33-67 ms
++    // gaps Chrome's rAF saw). With a valid pixel clock IOFramebuffer::setVBLTiming switches to its timing mode
++    // (gIOFBVBLThrottle, on by default): vblDelta = h_total * v_total / pixel clock, fixed, and vblCount advances by
++    // round(elapsed / interval). The clock is chosen so that interval is the tick's own period (fFrameNs): the panel
++    // itself is never programmed from this (setDisplayMode accepts only mode 1, unchanged). Verified in user space by
++    // forcing CoreVideo's delta to a constant: gaps 4-frame 1/12 s -> 0, output-time error seconds -> < 9 ms.
++    // debug.phxfb_timing=0 before a display reconfiguration (or at boot via the LaunchDaemon) gives the old answer.
+     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
+         if (mode != 1 || !info) return kIOReturnUnsupportedMode;
+         bzero(info, sizeof(*info));
+-        info->appleTimingID = kIOTimingIDInvalid;   // no detailed timing: the panel keeps the firmware's
++        info->appleTimingID = kIOTimingIDInvalid;   // no Apple timing ID: the panel keeps the firmware's mode
++        if (!gTiming || fHTotal <= fWidth || fVTotal <= fHeight || !fFrameNs) return kIOReturnSuccess;
++        const uint64_t pixels = (uint64_t)fHTotal * fVTotal;
++        const uint64_t clock = pixels * 1000000000ull / fFrameNs;   // Hz, rounded down: IOFramebuffer's truncated pixels/clock == fFrameNs
++        IODetailedTimingInformationV2 &t = info->detailedInfo.v2;
++        t.pixelClock = t.minPixelClock = t.maxPixelClock = clock;
++        t.horizontalActive = fWidth;  t.horizontalBlanking = fHTotal - fWidth;
++        t.verticalActive = fHeight;   t.verticalBlanking = fVTotal - fHeight;
++        info->flags = kIODetailedTimingValid;
++        if (!fTimingLogged) { fTimingLogged = true;
++            PFBLOG("timing: %ux%u in %ux%u totals, pixel clock %llu Hz -> VBL interval %llu ns", fWidth, fHeight, fHTotal, fVTotal,
++                   (unsigned long long)clock, (unsigned long long)(pixels * 1000000000ull / clock)); }
+         return kIOReturnSuccess;
+     }
+     IOItemCount getConnectionCount() override { return 1; }
+@@ -986,6 +1012,8 @@
+     else if (!backlightRead(&bl)) PFBLOG("backlight: the PWM is not running (no MMIO view, or off), no brightness control");
+     else if (!(fBacklight = phxBacklightCreate(this))) PFBLOG("backlight: the handler would not attach");
+     else PFBLOG("backlight: PWM at %u of %u", bl, kBlMax);
++    // before IOFramebuffer::start: its setup may ask for the mode's timing (getTimingInfoForDisplayMode needs the totals)
++    measureRefresh();
+     if (!IOFramebuffer::start(provider)) {
+         if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+         OSSafeReleaseNULL(fMmio); OSSafeReleaseNULL(fSurfMap); return false; }
+@@ -999,7 +1027,6 @@
+     setProperty("DisplayGammaEntryCount", 256ull, 32);
+     setProperty("DisplayGammaEntrySize", 1ull, 32);
+     setProperty("PhxFBWidth", fWidth, 32); setProperty("PhxFBHeight", fHeight, 32);   // the AGDC's panel timing reads these
+-    measureRefresh();
+     setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
+     if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }   // the AGDC's panel timing
+     nanoseconds_to_absolutetime(fFrameNs, &gPhxFrameAbs);

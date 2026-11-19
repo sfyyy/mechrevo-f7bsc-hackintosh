@@ -151,7 +151,7 @@ CPU、内存都不高，但 Chrome 滚动、拖动窗口明显卡顿。`chrome:/
 后续优化方向（WindowServer 合成每帧是单线程串行的，插件的翻译开销全部落在它的渲染线程上，只能靠降低每帧开销）：
 
 1. ~~每帧重复创建 / 释放 GPU 内存~~：已由 `nvmtl-perf2-surface-in.patch` 解决，见下文。
-2. **每次 draw 新建描述符集**：未解决，见下一节。
+2. **每次 draw 新建描述符集**：已修复（`nvmtl-fetch-mask.patch`），见下文。
 3. **把非关键路径的工作移出渲染线程**：surface-in 的拷贝已移出（见下文）；资源回收、BO 释放尚未处理。
 
 ### 第二轮：surface-in 拷贝延迟提交 + surface 缓存短暂保留（`patches/nvmtl-perf2-surface-in.patch`，2026-11-19）
@@ -201,39 +201,110 @@ WindowServer 连续崩溃 3 次，phxboot 关掉加速，桌面退回软件合�
 - `macos/nullarc/perf/gpuinfo.py`：通过 DevTools 协议导出 `chrome://gpu` 全文。本机：Graphite → Dawn → Metal →
   NVMTL → RADV，Zero-copy 分块，无驱动报错，无回退，所以 Chrome 侧没有可调的配置。
 
-## WindowServer 每次 draw 新建描述符集（待优化）
+## WindowServer 每次 draw 新建描述符集（已修复：`patches/nvmtl-fetch-mask.patch`，2026-11-19 已装入 WindowServer）
 
-perf2 之后，这是 WindowServer 用户态里最大的一块插件开销（忙碌样本 1948 个中）：
+perf2 之后，这是 WindowServer 用户态里最大的一块插件开销（忙碌样本 1948 个中，`nvmtlBindSamplerPipeline` 298 个，约 15%；
+其中 `nvmtl_snapshot_set_md` 203 个，`radv_UpdateDescriptorSets` 130 个）。
 
-- `-[NVMTLRenderCommandEncoder nvmtlBindSamplerPipeline]` 298（15%），其中 `nvmtl_snapshot_set_md` 203（10%），
-  `radv_UpdateDescriptorSets` 130（7%）；`setFragmentTexture:` 139。
-- 原因：CoreAnimation 几乎每个 draw 都换一张纹理（每个图层一个 surface），`nvmtl_snapshot_set_c` 判断上一个集合已脏，
-  于是从池里取新集合，未变的绑定复制（dirty-only），变了的重写。每帧几十到上百个 draw，每个都要
-  `vkUpdateDescriptorSets`。
-- 方向：
-  1. **跨命令缓冲缓存写好的集合**：按（管线绑定掩码，各槽句柄）哈希。CA 每帧画的基本是同一批窗口 surface，
-     命中后直接绑定、不再写。集合写好后不再修改，复用是安全的；要处理的是生命周期：句柄被销毁时让对应条目失效，
-     并且只能在 GPU 用完后回收。
-  2. 只有纹理槽变化时（CA 的典型情况），只写那一个 binding，其余用 copy；先量一下 `nvmtl_dirty_only_on` 实际复制了多少。
-  3. 评估 WindowServer 用 bindless 堆（日志里部分进程是 `bindless-all`）：纹理变成表里的下标，draw 之间不再换集合。
-- 验收：`wsprof.sh` 里 `nvmtlBindSamplerPipeline` 占比明显下降；`surftest` 和 bench2 不变差；看 WindowServer 日志
-  `commit high-water: N descriptor sets`。
+**真正原因**：不是“CA 每个 draw 都换纹理”，而是每个新集合都写满了全部 193 个描述符（32 个缓冲、128 张纹理、
+32 个采样器、地址表），每次 draw 两个集合（顶点、片元）。实测：每个集合写 193.00 个，复制 0 个。
 
-## 测试页最慢一帧总是 67 ms（待定位）
+- 插件靠 `nvmtl_spirv_bmask` 从 SPIR-V 算出每个阶段实际用到哪些 binding，只写这些。
+- CoreAnimation 的片元着色器都声明了 framebuffer fetch 输入（`[[color(n)]]`，set 3、binding 192）。这个函数只排除了
+  set 2（bindless 堆），把 set 3 的 192 也当成本阶段的 binding。192 不在合法范围内，于是判定失败，退回“全部 binding”。
+- set 3 本来就是单独绑定的（`nvmtl_fetch_set`；WindowServer 默认关 fetch，绑的是全零集合），不该算进来。
+
+修复：`nvmtl_spirv_bmask` 把 set 3 的变量和 set 2 一样排除，一行条件。开关：`NVMTL_FETCH_MASK=0` 恢复旧行为。
+不需要跨命令缓冲缓存（上午那一版缓存在 WindowServer 里约 6 分钟后让 GPU 挂住，看门狗杀掉 WindowServer，
+phxboot 关闭加速，已回滚；源码留在 `work/desccache-attempt-1253`）。
+
+测试（全部在应用进程里跑，插件不安装、WindowServer 不动，见下面的 `runp.sh`）：
+
+- `tests/carender.m`：在进程内用 CoreAnimation 自己的 Metal 渲染器（`CARenderer`）渲染一棵和 WindowServer 类似的图层树：
+  IOSurface 内容、每帧轮换 surface、圆角、移动，并逐帧回读检查每个图层中心的颜色。它的采样分布和 WindowServer 一致
+  （`nvmtlBindSamplerPipeline` 18%、`radv_UpdateDescriptorSets` 8%），可以替代 WindowServer 做测试。
+- 结果：每个集合写的描述符从 193 个降到 6.8 个；`nvmtlBindSamplerPipeline` 的样本数降 66%（466 → 158），
+  `radv_UpdateDescriptorSets` 基本消失。按 WindowServer 的配置（fetch 关）跑，CARenderer 每帧 CPU 时间降 10–20%（每轮 3 次）。
+- 正确性：carender 最多 10000 帧 × 120 层 × 8 个 surface，0 个错误像素；半透明图层整帧回读和旧插件逐字节一致
+  （fetch 开、关各两帧）；`surftest`、`desctest`、`descsurfdraw`、`descdrawstress` 全部通过。
+
+安装（`work/` 下，需要 sudo，WindowServer 重启后才加载）：`sudo bash install-fetchmask.sh`（装 `NVMTLDriver.fetchmask`，
+即 perf2 加本补丁），然后重启。回滚：`sudo bash rollback-fetchmask.sh` 后重启；WindowServer 崩溃时用
+`sudo bash recover-fetchmask.sh`（回滚、清除 phxboot 的关闭标记、重新启用 PhxAMDFB、重启）。
+
+WindowServer 验收（2026-11-19，装好后重启，开机负载降下来后测）：
+
+| | perf2（`s2`） | perf2 + fetch-mask（`fm-ws`） |
+|---|---|---|
+| WindowServer 忙碌样本（8 秒） | 1948 | 1075 |
+| `nvmtlBindSamplerPipeline` | 298（15.3%） | 52（4.8%） |
+| `nvmtl_snapshot_set_md` / `radv_UpdateDescriptorSets` | 203 / 130 | 低于统计阈值 |
+| bench2（3 轮）FPS / 每 25 秒卡顿 / 最慢帧 | 58.1–58.8 / 17–23 / 67 ms | 57.8–58.8 / 14–26 / 67–68 ms |
+
+WindowServer 日志里有 `framebuffer-fetch inputs (set 3) left out of the per-stage descriptor mask`。用户态忙碌样本少了约
+45%，FPS 和卡顿持平：卡顿和 67 ms 来自下面一节的 CVDisplayLink，不是 WindowServer 的 CPU。还要再观察一段时间，
+确认长时间运行没有问题。
+
+`tests/runp.sh DRIVER 命令...`：让测试程序加载一个**未安装**的插件。第一次运行时把已安装的 bundle 复制到 `tests/drv`
+（翻译器和 air-runtime 要在同一目录），编译 `tests/shim/redirect.c`。这个 DYLD 垫片把 Metal 对 NVMTLDriver 的
+dlopen 改到指定文件，并在 `class_getImageName` / `objc_copyClassNamesForImage` 上返回 bundle 路径（Metal 会核对这两项）。
+不用 sudo，也不用重启，只影响这一个进程。
+
+## 测试页最慢一帧总是 67 ms（已修复：`patches/phxaccel-vbl-timing.patch`，2026-11-19 已安装）
 
 每 3 秒窗口的最慢帧几乎固定是 66–68 ms，也就是连丢 3 帧；一轮 25 秒里有 17–36 次 >25 ms 的帧。原插件和 perf2 都有
-（perf2 次数约减半，最慢帧不变），所以不是 perf2 引入的。今早一次测量（09:10）曾出现连续窗口 0 卡顿，同一插件之后重测
-没有复现，环境影响很大（发热、后台负载、开机后多久，这台机器的 `pmset -g therm` 读不到温度）。
+（perf2 次数约减半，最慢帧不变）。
 
-待查方向：
+2026-11-19 的测量（Chrome 关闭、锁屏，WindowServer 约 10% CPU，`caffeinate -u` 保持屏幕点亮）：
 
-1. 先区分是 Chrome 侧还是 WindowServer 侧：同时记录 Chrome 的 rAF 时间戳和 WindowServer 每帧提交/完成时间
-   （插件的 `NVMTL_PERF_LOG=1` 会在每次提交打 `PERFSUB` 行：hook / submit / wait / retire 耗时），对齐看慢帧时谁在等。
-2. `NVMTL_WS_WAIT_COMPLETION=1`（`macos/display` 为绕过动画残影打开）：WindowServer 每帧等 GPU 完成，渲染线程约 12%
-   的时间在 `waitUntilCompleted`。一帧 GPU 时间稍超 16.7 ms 就会连锁错过 vsync；量化每帧 GPU 时间分布。
-3. 67 ms ≈ 4 个刷新周期：检查是否和软件 VBL / 双缓冲翻页（`debug.phxfb_dbuf`）的超时或相位有关；查 PhxAMDFB 日志里的翻页等待。
-4. 换不滚动 / 不画 canvas 的页面，看是哪种负载触发（滚动的分块上传、canvas 的 surface-out 回读）。
-- 验收：bench2 最慢帧 < 34 ms，卡顿次数明显下降。
+1. **不是 Chrome**：一个和 Chrome 无关的原生程序 `perf/vblprobe.m`（只开一个 CVDisplayLink，记录回调间隔）在没有 Chrome 时
+   同样出现 33 / 50 / 67 ms 的间隔：每 2 分钟 2–3 次，5 分钟最多 28 次。Chrome 的 rAF 用的就是这个时钟，所以 Chrome
+   的 67 ms 帧应当来自这里，和页面内容无关。
+2. **不是内核的软件 VBL**：`perf/vbltick.c` 每 0.25 ms 读一次 PhxAMDFB 的 `debug.phxfb_vbl_n` / `_late_us_sum`。
+   30 秒 1800 个 tick，最晚只晚 0.6 ms，用户态看到的间隔全部是 1 个周期。同期 vblprobe 有 3 次 4 个周期（66.7 ms）的间隔。
+   翻页等待也正常（`debug.phxfb_dbuf_wait_max_us` 2.9 ms，0 次超时）。
+3. **不是全系统停顿**：`hiccup`（两个只读时钟的忙循环线程）观察到两个线程同时停 20–50 ms 的情况，5 分钟约 25 次，
+   来源未查。但它们和 CVDisplayLink 的间隔**没有一次重叠**（0/19），是另一件事，留作记录。
+4. **WindowServer 发布的 VBL 时间**（`SLSDisplayGetPriorVBLTime`，CVDisplayLink 每帧用它重新对时；`perf/vblstale.m`）
+   2 分钟里有 8 次停了两个周期没更新，但时间上也和 CVDisplayLink 的间隔对不上。
+5. CVDisplayLink 自己的输出时间戳在间隔前后跳了好几秒（`hostTime` 前后不一致），`rateScalar` 0.991–1.001，
+   名义周期每次启动读到的都不一样（16.40–16.88 ms）。说明 CoreVideo 对这块屏幕的时间模型不稳，它按错误的预测
+   多睡了 2–3 个周期。CoreVideo 用的是 WindowServer 的 VBL 时间和周期（`SLSDisplayGetCurrentVBLDelta`），而它们来自
+   PhxAMDFB 的软件 tick（每个 tick 有 0–0.6 ms 抖动）。最可疑的是这个抖动，或者 IOFramebuffer 报给系统的时序信息
+   和 tick 不一致，尚未证实。
+
+### 根因（逆向 CoreVideo 和 IOGraphicsFamily）
+
+- CoreVideo 的 `CVCGDisplayLink::updateDisplayTiming` 每次回调前都重新读 `SLSDisplayGetCurrentVBLDelta`，直接当作刷新周期；
+  视频时间 = 开机以来的帧数 × 周期，所以周期 0.5% 的抖动会变成好几秒的时间误差（上面第 5 条）。
+- `CVDisplayLink::calculateNextWakeUpTime` 对 ≤ 4 个周期的等待直接相信，超过才重新同步，于是误差落在 1–4 个周期之间时
+  就表现为 33 / 50 / 67 ms 的间隔（从不出现 5 个周期以上）。
+- WindowServer 的 VBL delta 来自 IOFramebuffer 共享内存。`IOFramebuffer::handleVBL` 有一个“时序模式”：显示模式带有效的
+  detailed timing（像素时钟 = 最小 = 最大）时，vblDelta 固定为 `htotal × vtotal / pixclk`，不随 tick 抖动。PhxAMDFB 的
+  `getTimingInfoForDisplayMode` 把时序信息清零返回，所以从来没进过这个模式，vblDelta 每帧是两个 tick 触发时刻之差（16.51–16.82 ms）。
+- 用户态验证（`perf/cvfix.m`，把 CoreVideo 私有的 VBL delta 函数指针换成常数 16666666 ns）：66 ms 间隔从 12 秒 1 次降到 0，
+  `hostTime` 误差从秒级降到 < 9 ms。
+
+### 失败的尝试：`patches/phxaccel-vbl-spin.patch`
+
+让软件 tick 忙等到精确时刻再触发（`debug.phxfb_vbl_spin_us`）。同一次开机 A/B：spin=0 每 15 秒 890/892 次回调；spin=200
+只有 687–777 次，间隔约 100 个。时间戳变准后 CoreVideo 反而锁到错误的整周期上。默认已改为 0，保留补丁只为记录；
+vbl-timing 补丁在它之上。
+
+### 修复：`patches/phxaccel-vbl-timing.patch`
+
+PhxAMDFB 返回 `kIODetailedTimingValid`，总尺寸 2720×1481，像素时钟 = floor(像素数 × 1e9 / 周期 ns) = 241699209
+（对应间隔 16666666 ns，正好是软件 tick 的周期）；`measureRefresh` 移到 `IOFramebuffer::start` 之前。开关
+`debug.phxfb_timing`（1 开，0 旧行为，设置显示模式时读取）。需要重新编译 PhxAccel、sudo 安装、重启。
+
+验收（2026-11-19 安装后）：
+
+- `ioreg` 的 `IOFBCurrentPixelClock` = 241699209；WindowServer 读到的 VBL delta 恒为 16.667 ms。
+- `perf/cvjitter`：900/900 次回调无间隔，`hostTime` 误差 ≤ 8.4 ms；`vblprobe` 0 个间隔。
+- bench2 × 3：FPS 60.0、卡顿 0、最慢帧 18 ms（同一天修复前 56.7–57.7 FPS、卡顿 17–31、最慢 50–67 ms）。bench3 × 3 相同。
+- WindowServer CPU 31–49%（原 24–41%），因为它现在真的合成满 60 帧。
+
+排查工具：`defaults write com.apple.corevideo cv_note -int 5` 打开 CoreVideo 日志（`log stream` 子系统 `com.apple.corevideo`）。
 
 ## kernel_task 空闲时占 30–40% CPU（已缓解：`xhcinudge=1` → `4`）
 

@@ -1,0 +1,38 @@
+--- a/src/nmplugin/nvmtl_vk.c	2026-11-19 14:14:44
++++ b/src/nmplugin/nvmtl_vk.c	2026-11-19 14:14:44
+@@ -2079,6 +2079,14 @@
+     }
+     free(heap);
+     return ok;
++}
++static int nvmtl_fetch_mask_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_FETCH_MASK"); on = !(e && *e == '0');
++        nvlog("vk: framebuffer-fetch inputs (set 3) %s the per-stage descriptor mask (NVMTL_FETCH_MASK=%s)",
++              on ? "left out of" : "COUNTED in - fetch pipelines rewrite every descriptor per draw,", e ? e : "unset"); }
++    return on;
+ }
+ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
+ {
+@@ -2086,14 +2094,18 @@
+     memset(out, 0, 4 * sizeof *out);
+     if (!p || nw < 5 || w[0] != 0x07230203u) return 0;
+     // the bindless texture heap (set 2, bound once per command buffer) has bindings of its own: its binding 0 is not
+-    // the stage's buffer 0, and counting it put every textured draw on the slow descriptor path
++    // the stage's buffer 0, and counting it put every textured draw on the slow descriptor path.
++    // So do the [[color(n)]] framebuffer-fetch inputs (set 3, binding 192+n, bound by nvmtl_fetch_set): counted, their
++    // binding 192 failed the mask, and every CoreAnimation pipeline (they all read the destination) rewrote all 193
++    // descriptors of both stage sets for every draw - 15% of WindowServer's user time (2026-11-19).
+     const uint32_t bound = w[3];
+     uint8_t *heap = bound && bound < (1u << 24) ? (uint8_t *)calloc(bound, 1) : NULL;
+     if (!heap) return 0;
+     for (size_t i = 5; i < nw; ) {
+         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+         if (!wc || i + wc > nw) { free(heap); return 0; }
+-        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
++        if (op == 71 && wc == 4 && w[i + 2] == 34 && (w[i + 3] == 2 || (w[i + 3] == 3 && nvmtl_fetch_mask_on())) && w[i + 1] < bound)
++            heap[w[i + 1]] = 1;
+         i += wc;
+     }
+     int ok = 1;
