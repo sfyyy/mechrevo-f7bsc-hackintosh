@@ -1,0 +1,53 @@
+--- a/src/nmplugin/NVMTLObjects.h	2026-11-19 20:25:46
++++ b/src/nmplugin/NVMTLObjects.h	2026-11-19 20:25:46
+@@ -295,6 +295,9 @@
+ // a private image standing in for a buffer texture RADV will not alias: refilled from _backBuf when the buffer's bytes
+ // change (_bufHash), written back after the GPU draws into it
+ @interface NVMTLTexture () { @public BOOL _bufCopy, _bufHashed; uint64_t _bufHash; } @end
++// CAMetalLayer drawables: QuartzCore sets the private descriptor flag isDrawable; CoreImage reads -[MTLTexture isDrawable]
++// to orient its output (drawables get top-left rows). Without it CI renders into drawables upside down.
++@interface NVMTLTexture () { @public BOOL _drawable; } @end
+ static void nvmtl_heap_park(NVMTLHeap *h, nvk_image *img, const uint32_t *key, NSUInteger off, NSUInteger len);
+ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared);
+ @interface NVMTLIndirectCommandBuffer () { @public uint32_t _purge; } @end
+--- a/src/nmplugin/NVMTLObjects.m	2026-11-19 20:25:46
++++ b/src/nmplugin/NVMTLObjects.m	2026-11-19 20:25:46
+@@ -1506,6 +1506,7 @@
+ - (NSUInteger)bufferOffset { return _backBuf ? _backOff : _parent ? [_parent bufferOffset] : 0; }
+ - (NSUInteger)bufferBytesPerRow { return _backBuf ? _backBPR : _parent ? [_parent bufferBytesPerRow] : 0; }
+ - (BOOL)isShareable { return _parent ? NO : _shareable; }
++- (BOOL)isDrawable { return _drawable || (_parent && [(id)_parent isDrawable]); }
+ - (MTLTextureSwizzleChannels)swizzle { return _hasSwz ? _swz : MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha); }
+ - (BOOL)isSparse { NVMTLTexture *r = _parent ? _parent : self; return (r->_heap && r->_heap->_type == MTLHeapTypeSparse) || (r->_subHeap && r->_subHeap->_type == MTLHeapTypeSparse); }
+ - (uint32_t)swizzleKey { MTLTextureSwizzleChannels c = [self swizzle]; return (uint32_t)c.red | (uint32_t)c.green << 8 | (uint32_t)c.blue << 16 | (uint32_t)c.alpha << 24; }
+--- a/src/nmplugin/NVMTLDevice.m	2026-11-19 20:25:46
++++ b/src/nmplugin/NVMTLDevice.m	2026-11-19 20:25:46
+@@ -1052,6 +1052,11 @@
+     t->_keepNs = now; g_skeep_miss++;
+     keep[key] = t;
+     nvmtl_surface_keep_sweep(keep, now, 0);
++}
++// Private MTLTextureDescriptor flag QuartzCore sets for CAMetalLayer drawables (see NVMTLTexture _drawable).
++static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
++    static SEL sel; if (!sel) sel = sel_registerName("isDrawable");
++    return [d respondsToSelector:sel] && ((BOOL (*)(id, SEL))objc_msgSend)(d, sel);
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+     @synchronized(self) {
+@@ -1088,7 +1093,7 @@
+         backing->_keepNs = nvmtl_skeep_now(); g_skeep_hits++;
+         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+         if (alias) {
+-            alias->_viewParent = nil; alias->_usage = use; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
++            alias->_viewParent = nil; alias->_usage = use; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = nvmtl_desc_drawable(d);
+             nvmtl_texture_desc_swizzle(alias, d);
+             return alias;
+         }
+@@ -1101,6 +1106,7 @@
+     t->_fmt = d.pixelFormat;
+     t->_stex = t->_i.storage != 0;
+     t->_usage = use;
++    t->_drawable = nvmtl_desc_drawable(d);
+     nvmtl_texture_desc_swizzle(t, d);
+     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
+     if (key && !t->_vramOn) nvmtl_surface_keep(self, key, t);

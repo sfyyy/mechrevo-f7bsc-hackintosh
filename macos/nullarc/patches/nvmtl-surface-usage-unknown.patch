@@ -1,0 +1,34 @@
+--- a/src/nmplugin/NVMTLDevice.m	2026-11-19 19:54:23
++++ b/src/nmplugin/NVMTLDevice.m	2026-11-19 19:54:23
+@@ -1072,7 +1072,12 @@
+     t->_fbo = nvmtl_desc_fbo(d);
+     uint32_t vkf = 0, bpp = 0; int a8 = 0;
+     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
+-    int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
++    // MTLTextureUsageUnknown (0) means "any usage" in Metal. CoreVideo's CVMetalTextureCache passes 0 by default and
++    // callers then render or compute-write into the texture (CoreImage's CIRenderDestination checks for ShaderWrite;
++    // AweSun's remote-desktop view went black). Make such surface textures writable and report every usage.
++    const MTLTextureUsage use = d.usage ? d.usage
++        : (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget);
++    int wantStex = (use & MTLTextureUsageShaderWrite) != 0;
+     NSData *key = surf ? nvmtl_surface_key(surf, plane, w, h, d.pixelFormat, t->_ropt, (uint64_t)t->_fbo) : nil;
+     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+     // Failed BAR imports use a private image. Repeated wrappers of the same
+@@ -1083,7 +1088,7 @@
+         backing->_keepNs = nvmtl_skeep_now(); g_skeep_hits++;
+         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+         if (alias) {
+-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
++            alias->_viewParent = nil; alias->_usage = use; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+             nvmtl_texture_desc_swizzle(alias, d);
+             return alias;
+         }
+@@ -1095,7 +1100,7 @@
+     t->_plane = plane;
+     t->_fmt = d.pixelFormat;
+     t->_stex = t->_i.storage != 0;
+-    t->_usage = d.usage;
++    t->_usage = use;
+     nvmtl_texture_desc_swizzle(t, d);
+     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
+     if (key && !t->_vramOn) nvmtl_surface_keep(self, key, t);
