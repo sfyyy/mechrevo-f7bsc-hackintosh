@@ -583,6 +583,25 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 属于驱动整体性能工作，暂不继续；先做 VCN。临时缓解：投屏时少开最大化、带半透明侧栏的窗口。
 关掉统计：从 `nvrm610.conf` 删掉 `NVMTL_WS_GPUTIME=1`（关掉后零开销，重启生效）。
 
+## 没有硬件视频编解码（VCN），共享屏幕和远程桌面全靠 CPU（计划中，必须做）
+
+- 腾讯会议启动时检测到 `no hw h264 encoder ablity` / `no hw hevc encoder ablity`（`video_ability_mac.c`），共享屏幕时用
+  CPU 软件编码 2560×1440 HEVC，CPU 温度 88–91 °C。
+- 向日葵远程控制时 `support hevc 0`：`VTIsHardwareDecodeSupported` 对 H.264 和 HEVC 都返回 0，只能软件解码。
+- 原因：780M 的视频引擎 VCN 4.0 没有驱动。PhxBringup 的命令提交只接受 GFX 和 COMPUTE（`PhxBringup.cpp` 中的
+  `ip_type` 检查），RADV 因此报告不出视频队列（`vkprobe` 看不到 video queue family）。macOS 自带的 AMD 视频驱动
+  不支持 Phoenix。
+
+计划：
+
+1. PhxBringup：用 SMU 给 VCN 上电，经 PSP `LOAD_IP_FW` 加载 VCN 4.0 固件，建立 VCN 4 统一队列（ring、doorbell、
+   fence），命令提交放行视频类任务。先用空命令验证队列能执行完。参考 Linux `vcn_v4_0.c` 和 `amdgpu_vcn.c`。
+2. 内核接口：`AMDGPU_INFO_HW_IP_INFO` 报告 VCN 队列，`AMDGPU_INFO_VIDEO_CAPS` 报告编解码能力，补上固件版本查询。
+3. Mesa（RADV）：在 nullarc 的 Mesa 基线上打开 Vulkan Video 的 H.264/HEVC 解码和编码，用独立程序验证。
+4. macOS 接入：在加载插件的进程里调用 VideoToolbox 的 `VTRegisterVideoEncoderWithInfo` 和
+   `VTRegisterVideoDecoderWithInfo`，注册硬件编码器和解码器，输入输出直接用 IOSurface（NV12），让腾讯会议、
+   向日葵等程序检测到并使用硬件编解码。macOS 的硬件解码默认在 `VTDecoderXPCService` 进程里运行，需要单独处理。
+
 ## 没有 HiDPI
 
 PhxAMDFB 只报告固件 GOP 点亮的一个模式（2560×1440），没有缩放器，也没有 `kDisplayModeValidForHiResFlag`，
