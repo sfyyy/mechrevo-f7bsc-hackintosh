@@ -7,6 +7,9 @@
 #   NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1  a command buffer that writes a shared IOSurface reports "scheduled" only after
 #                                          the GPU has finished it, so CoreAnimation in other processes (loginwindow's
 #                                          lock screen) hands WindowServer finished surfaces
+# Removed from nvrm610.conf (nullarc's installer writes it):
+#   NVMTL_WS_WAIT_INTERNAL=1               WindowServer also waited for every CoreAnimation offscreen pass; with screen
+#                                          capture on that halved the frame rate (display 27 -> 53 fps, 2026-11-21)
 set -u
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -27,6 +30,7 @@ if [ -f "$CONF" ]; then
   for k in $KNOBS; do
     grep -q "^$k\$" "$CONF" || { echo "$k" >> "$CONF" && echo "added $k to $CONF"; }
   done
+  grep -q '^NVMTL_WS_WAIT_INTERNAL=1$' "$CONF" && { sed -i '' '/^NVMTL_WS_WAIT_INTERNAL=1$/d' "$CONF"; echo "removed NVMTL_WS_WAIT_INTERNAL=1 from $CONF"; }
 else
   echo "warning: $CONF not found (nullarc not installed?) - plugin knobs not set"
 fi

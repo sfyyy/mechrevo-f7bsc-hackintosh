@@ -476,6 +476,113 @@ XHC 中断数与间隔严格成比例，确认全部来自 XhciNudge；IPI 数�
 工具（不在仓库中）：`~/Documents/apple/work/chrometest/setnudge.sh <ms>`（需 sudo；自动找内置盘上的 OpenCore EFI，
 重启后 diskN 编号会变）、`kprof.sh`（需 sudo，空闲约 40 秒，结果在 `kprof/<值>/`，汇总追加到 `kprof/results.txt`）。
 
+## 共享屏幕 / 录屏时采集只有 17–19 帧，本机画面也掉到 40 帧（已缓解：`patches/nvmtl-ws-capture-nowait.patch` + 去掉 `NVMTL_WS_WAIT_INTERNAL`）
+
+2026-11-20 腾讯会议共享屏幕：功能正常，但对方看到的画面很卡。腾讯会议日志（`xcast_*.log`）显示，它用
+ScreenCaptureKit 按 2560×1440 BGRA、25 帧采集，实际采集和编码在 11–21 帧之间波动。
+
+复现（`~/Documents/apple/work/scktest`，不在仓库中）：`anim` 开一个 60 Hz 变色窗口，`sck <宽> <高> <帧率> <格式> <秒>`
+统计 ScreenCaptureKit 实际帧率和帧间隔：
+
+| 请求 | 实际 | 帧间隔 |
+|---|---|---|
+| 60 帧，任意分辨率 / 格式 | 28–42 帧 | 集中在 32 ms（每隔一个 vsync） |
+| 25 帧 | 17–19 帧 | 40–64 ms |
+
+采集期间屏幕翻页从 60 次/秒降到 40–42 次/秒（`debug.phxfb_dbuf_flips`），所以**本机画面也会卡**。
+帧率与分辨率、格式无关；客户端 CPU 读取一帧只要 0.7 ms，普通进程里全屏 IOSurface 拷贝的 GPU 往返约 1 ms。
+
+根因（`wssample.sh`：sudo 对 WindowServer 各采样 8 秒，一次不采集、一次采集）：
+
+- ScreenCaptureKit 让 WindowServer 在主线程上把所有窗口**再合成一遍**，写进「Selective Sharing」采集表面
+  （`WSSelectiveSharingUpdateDisplayStreamSurface` → `CompositorMetal::CompositeLayersToDestination`），
+  再用 `DisplayStreamStateMetal::CopyFrame` 拷到客户端的缓冲。
+- 为绕过 B-58 残影，本机设置了 `debug.nvaccel_surface_gpu_on=0` 和 `NVMTL_WS_WAIT_COMPLETION=1`（见上文「动画残影」）。
+  于是插件在 `commitAndWaitUntilSubmitted` 里对每个写 IOSurface 的命令缓冲调用 `waitUntilCompleted`，
+  在主线程上同步等 GPU 完成。
+- 主线程忙碌比例从 27% 升到 52%。显示合成的等待从 271 个采样增加到 969 个；采集的二次合成又等了 627 个采样
+  （共 1196 个）。一帧里要同步等两次全屏合成，超出 16.7 ms，于是显示和采集都隔一个 vsync 才出一帧。
+
+修复 `macos/nullarc/patches/nvmtl-ws-capture-nowait.patch`（基于已安装的 nn-hide 版本）：采集二次合成的目标表面只会被
+随后的 `CopyFrame` 在 GPU 上读取。进程内所有 Metal 队列共用一个 Vulkan 队列，GPU 按提交顺序执行；`CopyFrame`
+自己会等待，结果也由它交给客户端。所以只在 WindowServer 里，对只写「Selective Sharing」表面（SkyLight
+`SurfacePool` 给这个池起的 IOSurface 名字）的命令缓冲，不再等 GPU 完成，也不再推迟 scheduled
+（`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES`）。显示合成的等待保持不变（B-58）。
+
+- 验证 `tests/wsnowait.m`（编译成名叫 `WindowServer` 的程序，经 `runp.sh` 加载未安装的插件）：写采集表面的命令缓冲
+  0.15 ms 返回（旧版 23.7 ms，即等完 40 次全屏拷贝），随后另一条队列上的拷贝读到的像素正确；其他表面照旧等待。
+  `carender` 通过，耗时与旧版相同（5.15 / 5.19 ms 每帧）。
+- 安装：`sudo bash ~/Documents/apple/work/install-capfix.sh`，然后重启（WindowServer 重启后才加载）。
+  撤销：`rollback-capfix.sh`；不重装也可以关掉：在 `nvrm610.conf` 加 `NVMTL_WS_CAPTURE_WAIT=1` 后重启。
+- 装后检查：`/tmp/nvmtl.log` 应出现 `capture-nowait: WindowServer writes surface … named 'Selective Sharing' -> capture composite`；
+  `anim` + `sck 2560 1440 25 BGRA 8` 的帧率，以及采集期间的 `debug.phxfb_dbuf_flips` 每秒增量。
+
+2026-11-21 装上补丁后复测：采样确认采集二次合成下已没有 GPU 等待（627 → 0 个采样），但屏幕合成本身在采集期间
+每帧要等 GPU 约 5 ms，采集仍是 20 帧，屏幕约 30 帧。再在同一次开机里做 A/B（`tests/ab.sh`：60 Hz 动画 +
+采集，统计采集帧率与 `phxfb_dbuf_flips`）：
+
+| 设置 | 采集时屏幕（请求 25 帧） | 采集（请求 60 帧） | 采集时屏幕（请求 60 帧） |
+|---|---|---|---|
+| 原设置（WindowServer 自己等合成 + `NVMTL_WS_WAIT_INTERNAL=1`） | 27–29 帧 | 22–24 帧 | 24–25 帧 |
+| `surface_gpu_on=1`，保留 `WAIT_INTERNAL` | 35–40 帧 | 40–45 帧 | 42–48 帧 |
+| **去掉 `WAIT_INTERNAL`，`surface_gpu_on=0`（现用）** | **45–56 帧** | **39–49 帧** | **42–54 帧** |
+| 去掉 `WAIT_INTERNAL`，`surface_gpu_on=1` | 30–45 帧 | 29–39 帧 | 31–40 帧 |
+
+不采集时一直是 59–60 帧。主要开销是 `NVMTL_WS_WAIT_INTERNAL=1`（nullarc 安装时写入 `nvrm610.conf`）：WindowServer
+连 CoreAnimation 每次离屏绘制都要等 GPU 完成。去掉它以后，内核等待（`surface_gpu_on=1`）没有额外收益，所以保留
+B-58 的绕过。`surface_gpu_on=1` 期间使用未见残影。`macos/display/install.sh` 现在会从 conf 删掉这一行。
+
+- 撤销：`echo NVMTL_WS_WAIT_INTERNAL=1 | sudo tee -a /Library/GPUBundles/nvmtl/nvrm610.conf`，重启。
+- 请求 25 帧时采集仍只有约 21 帧：ScreenCaptureKit 只在 WindowServer 出帧时出帧、且两帧至少相隔 40 ms，屏幕约
+  50 帧时间隔落在 40–60 ms。屏幕在采集期间稳定 60 帧才能拿到满 25 帧，剩下的是 WindowServer 主线程上 CoreAnimation
+  组装命令的 CPU 开销（插件的绘制命令路径）。
+
+实际腾讯会议投屏（2026-11-21，采集 2048×1152 `420f` 25 帧，排除自身窗口）：屏幕仍只有 25–34 帧（叠加 60 Hz 动画也是
+33 帧），主线程忙约 64%。WindowServer 采样（`tests/wslive.sh`，8 秒，约 264 帧）中主线程每帧约 15.6 ms：
+
+| 环节 | 采样 | 每帧 |
+|---|---|---|
+| 屏幕合成：CoreAnimation 组装命令（CPU） | 1134 | 4.3 ms |
+| 屏幕合成：等 GPU 完成（B-58 绕过） | 1188 | 4.5 ms |
+| 采集二次合成（已不等 GPU，日志确认 `capture composite, no completion wait`） | 507 | — |
+| `CopyFrame` 缩放 + 转 420（等 GPU 339，`initialize_scale_program` 98） | 458 | — |
+| `prepare_coreanimation` | 475 | 1.8 ms |
+
+剩余开销在插件的绘制命令路径（CPU）和屏幕合成的同步等待上，需要继续做驱动性能优化：
+`initialize_scale_program` 是否每帧重建；`CopyFrame` 的等待能否像采集合成一样省掉（它写的是交给客户端的表面，
+需要跨进程的完成标记）；以及 B-58 的根因。
+
+同一次投屏里的 A/B（叠加 60 Hz 动画，看 `phxfb_dbuf_flips`）：`surface_gpu_on=1` 时 31–32 帧（还记录到 1 次
+`gpu_timeouts`），改回 0 时 33 帧；GPU 频率上限从 800 MHz 临时调到 1600 MHz（`phxctl smu 0x1b 1600`）后是 31–36 帧，
+屏幕合成的 GPU 等待只从 1188 降到 1104 个采样。`phxfb_dbuf_waits` 为 0，VBL 每秒 60 次。所以等待的大头不是 GPU
+算力。怀疑是排队：所有进程共用一个 GFX 队列、没有优先级（插件 `setGPUPriority` 不支持），WindowServer 的合成要排在
+腾讯会议等程序提交的工作后面。下一步：让插件在 WindowServer 里统计每个命令缓冲从提交到 GPU 开始、从开始到结束
+各用了多少时间（GPU 时间戳），区分排队和执行。
+
+插件统计（`NVMTL_WS_GPUTIME=1`，`patches/nvmtl-ws-capture-nowait.patch` 所在构建；每 2 秒一行写进 `/tmp/nvmtl.log`）把
+WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms，平均）：
+
+| 情况 | 屏幕 | 排队 | GPU 执行 | 完成→发现 | 合计 |
+|---|---|---|---|---|---|
+| 不投屏 | 59 帧 | 0.10 | 0.13 | 0.07 | 0.35 |
+| 投屏（活动监视器、Chrome 全屏开着） | 32 帧 | 0.26 | 4.4 | 1.0 | 5.8 |
+| 同上，GPU 频率上限和下限都设为 2600 MHz | 32 帧 | 0.25 | 3.2 | 0.8 | 4.5 |
+| 投屏，关掉活动监视器、最小化 Chrome，800 MHz | 33 帧 | 0.12 | 2.8 | 0.85 | 3.9 |
+
+- 不是排队（其他进程的 GPU 工作）造成的；是投屏时屏幕合成本身变重：不投屏时只重画变化的小块，投屏时每帧重画整屏。
+- 逐 pass GPU 计时（`touch /tmp/nvmtl-passtime-request` 让 WindowServer 记录 400 个 pass，输出在 WindowServer 的
+  `$TMPDIR/nvmtl-passtime-<pid>.log`，需 sudo 取出）：一次合成 59 个 pass，其中一个 2560×1320 的离屏 pass（最大化的
+  活动监视器 / Chrome 窗口被 CoreAnimation 压平成纹理，`FlattenNode::retain_surface`）要 1.0–2.6 ms；
+  另有若干全屏 2560×1440 pass，每个约 0.2–0.25 ms（腾讯会议在 layer 1000 的全屏共享边框、程序坞层等）。
+- 频率提高 3 倍，GPU 执行只少 25%，说明主要受内存带宽或驱动生成的着色器效率限制，不是算力。
+- 关掉大窗口后单次等待降到 3.9 ms，但屏幕仍是 33 帧：主线程每帧还有 CPU 组装命令约 4 ms、采集二次合成约 3–4 ms、
+  `CopyFrame` 约 1.5 ms、准备工作约 1.8 ms，加上等待仍超过 16.7 ms。
+- 「完成→发现」在投屏时从 0.07 ms 涨到约 0.85 ms，插件的完成检测在负载下变慢，可以单独优化。
+
+结论：要让投屏时屏幕稳定 60 帧，需要同时降低插件在 WindowServer 里的 CPU 开销和 CoreAnimation 离屏 pass 的 GPU 开销，
+属于驱动整体性能工作，暂不继续；先做 VCN。临时缓解：投屏时少开最大化、带半透明侧栏的窗口。
+关掉统计：从 `nvrm610.conf` 删掉 `NVMTL_WS_GPUTIME=1`（关掉后零开销，重启生效）。
+
 ## 没有 HiDPI
 
 PhxAMDFB 只报告固件 GOP 点亮的一个模式（2560×1440），没有缩放器，也没有 `kDisplayModeValidForHiResFlag`，
