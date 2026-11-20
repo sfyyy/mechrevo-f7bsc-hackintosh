@@ -1,0 +1,47 @@
+--- a/src/phxbringup/PhxBringup.cpp	2026-11-18 11:15:24
++++ b/src/phxbringup/PhxBringup.cpp	2026-11-20 10:32:20
+@@ -24,7 +24,7 @@
+ 
+ #include "PhxNativeABI.h"
+ 
+-#define PHX_KEXT_BUILD 34u
++#define PHX_KEXT_BUILD 35u
+ 
+ // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
+ // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
+@@ -68,9 +68,12 @@
+ // Pools reported to RADV. E1 backs every BO with system memory, so these are budgets, not hardware:
+ // BAR0 is 256 MiB on this machine, the UMA carve-out 6 GiB.
+ static constexpr uint64_t kVisTotal = 256ull << 20;
+-static constexpr uint64_t kHiTotal = 1536ull << 20;
+-static constexpr uint64_t kGttCap = 512ull << 20;
+-static constexpr uint64_t kGttMaxBo = 256ull << 20;
++// F7BSC (build 35): every pool is wired system RAM on this APU (32 GiB), so the 1536/512 MiB budgets only made
++// WindowServer fail allocations (SkyLight then aborts -> back to the login window). Raised; RADV sizes its heaps from
++// vis + GTT, so the plugin also sees a 1.5 GiB "card" instead of 512 MiB and stops evicting/spilling as early.
++static constexpr uint64_t kHiTotal = 3840ull << 20;
++static constexpr uint64_t kGttCap = 2048ull << 20;
++static constexpr uint64_t kGttMaxBo = 1024ull << 20;
+ static constexpr uint64_t kHostCap = 4096ull << 20, kHostMaxBo = 1024ull << 20;   // host imports, per client
+ static constexpr uint64_t kVaMask = (1ull << 48) - 1;
+ static constexpr int kMaxMaps = 4096;
+@@ -178,7 +181,7 @@
+     // A context's page tables, in physically contiguous 64 KiB chunks allocated as it maps (most contexts need one or
+     // two): a single 4 MiB contiguous pool per context failed once memory was fragmented. Table i is page i % 16 of
+     // chunk i / 16; table 0 is the root.
+-    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 64;
++    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 256;   // 4096 tables = 8 GiB mapped per process (64 capped it at ~2 GiB)
+     struct VmCtx {
+         IOBufferMemoryDescriptor *chunk[kPtChunks];
+         uint64_t chunkPhys[kPtChunks];
+@@ -790,6 +793,10 @@
+         uint64_t *pte = pa ? vmPte(c, va + p, true) : nullptr;
+         if (!pte) {
+             r = pa ? kIOReturnNoMemory : kIOReturnVMError;
++            static uint32_t ptSaid;
++            if (pa && (ptSaid++ < 8 || (ptSaid & 1023) == 0))
++                IOLog("PhxBringup: GPU page tables of context %u full (%u of %u table pages) - a %llu-byte map refused\n",
++                      handle, c.used, c.pages, (unsigned long long)size);
+             break;
+         }
+         *pte = (pa & kPtAddrMask) | kPteSysFlags;

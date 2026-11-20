@@ -59,7 +59,7 @@ gfx 队列建立后命令处理器一直报告忙碌，PMFW 把 GFXCLK 钉在 26
 - 根治：用 nullarc#14 的 mesboot（建队列前写入 Linux 的门铃范围 `0 / 0x450`）重新编译。上游尚未合并、没有发布版本。
   队列建立后再写这些寄存器无效。
 
-## 截屏 / 录屏时 WindowServer 崩溃
+## 截屏 / 录屏时 WindowServer 崩溃（已修复：PhxBringup build 35）
 
 2026-11-17 20:29 记录到一次 WindowServer `SIGABRT`：
 
@@ -74,7 +74,30 @@ _XHWCaptureWindowListToIOSurface
 
 有程序请求窗口截图（截屏、录屏、共享屏幕、微信截图等），nullarc 的 Metal 驱动（`com.nullmoth.NVMTLDriver`）
 没能为截图目标创建 IOSurface 纹理，WindowServer 退出，表现为黑屏后回到登录界面。上游 BUGS.md 与 issue 中尚无记录。
-目前只能避开这类功能。
+
+之后 2026-11-19 20:24、11-20 09:06、10:00 又各一次，触发点是截屏、录屏、显示器休眠前截桌面，或新建显示表面。
+插件日志在崩溃前都是 `vk: colour image: VRAM full and no system-memory type takes it -> -2`，而当时图像只占几十 MB。
+
+**根因不是性能，是 PhxBringup 每个进程的 GPU 页表上限。** 每个进程的页表是 64 块 × 64 KiB = 1024 页，
+每页映射 2 MiB，合计约 2 GiB。显存池、GTT 池和导入的 IOSurface 都计入这一上限。
+`tests/vkprobe/vkfill` 一直申请到失败：不论先申请哪种内存，总量都停在 2032 MB（先 VRAM 1792 MB，GTT 只剩 240 MB）。
+WindowServer 长时间运行后加上截屏缓冲就会撞墙，映射失败 → 纹理为空 → SkyLight `abort`。
+另外，RADV 在 APU 上按「可见 256 MB + GTT 512 MB」的 2/3 报堆大小，插件因此以为显卡只有 512 MB，
+会过早把纹理驱逐或挪到系统内存，这也是卡顿来源之一。这些池在 APU 上都是锁定的系统内存，额度是人为设的。
+
+修复 `macos/nullarc/patches/phxbringup-ptfix.patch`（build 35，`EFI/OC/Kexts/PhxBringup.kext` 已更新，只换二进制，
+Info.plist 保持 F7BSC 版）：
+
+| 项 | build 34 | build 35 |
+|---|---|---|
+| 每进程页表（可映射总量） | 64 块 ≈ 2 GiB | 256 块 ≈ 8 GiB |
+| VRAM hi 池 | 1536 MiB | 3840 MiB |
+| GTT 上限 / 单块 | 512 / 256 MiB | 2048 / 1024 MiB |
+| RADV 堆（VRAM / GTT） | 512 / 256 MB | 1536 / 768 MB |
+| `vkfill` 可申请总量 | 2032 MB | 6128 MB |
+
+页表满时内核日志会出现 `PhxBringup: GPU page tables of context N full`。同一份原版源码用本机 CLT 编译，与 nullarc
+0.4.0 发布的二进制逐字节一致，说明补丁之外没有引入编译差异。验证：`tests/vkprobe/vkheap`（看堆大小）、`vkfill 0 2`。
 
 ## 调用 Vision 文字识别的程序启动即崩溃（nullarc 驱动 bug，已绕过 Shottr，待从源码修复）
 

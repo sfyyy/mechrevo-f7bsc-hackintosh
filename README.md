@@ -122,7 +122,7 @@ sudo bash macos/check.sh               # 查看状态
 |---|---|---|
 | Lilu、VirtualSMC、AppleALC、NVMeFix、RestrictEvents | 1.7.2 / 1.3.8 / 1.9.8 / 1.1.3 / 1.1.6 | acidanthera |
 | AMDRyzenCPUPowerManagement、SMCAMDProcessor | 0.7.2 补丁版 | trulyspinach/SMCAMDProcessor，`ryzenidle` 补丁来自 QiRanChenk/MECHREVO-WUJIE15XA-8745HS-Hackintosh |
-| PhxBringup | 1.0.0（build 34，加 `1002:15bf`） | luuumi-dev/nullarc 0.4.0（`src/phxbringup`，MIT 或 GPL-2.0） |
+| PhxBringup | 1.0.0（build 35 = build 34 + `macos/nullarc/patches/phxbringup-ptfix.patch`，加 `1002:15bf`） | luuumi-dev/nullarc 0.4.0（`src/phxbringup`，MIT 或 GPL-2.0） |
 | AMFIPass | 1.4.1 | 自行下载，见上文 |
 | SimpleHDA | 1.0.0 | 自行下载，见上文 |
 | AirportItlwm | 2.4.0（Tahoe 版） | laobamac 基于 OpenIntelWireless/itlwm 的分支 |
