@@ -22,13 +22,38 @@ update lock），任何一项不符就保持原来的单缓冲。
 打开带弹出动画的软件时，动画中途的画面（或鼠标指针）残留在屏幕上；截图时 WindowServer 重新合成，残影消失，
 所以截不到。
 
-原因：默认 `debug.nvaccel_surface_gpu_on=1` 时，WindowServer 不等 GPU 合成完成就交出画面，改由内核按标记等待；
-这套等待有遗漏，会显示没画完的画面。上游尚未定位根因（BUGS.md B-58，`docs/AUDIT-2026-11-14.md`）。本机与撕裂无关：
-双缓冲打开、`surface_gpu_on=1` 时残影照样出现，并记录到一次 `debug.nvaccel_surface_gpu_timeouts`。
+原因：默认 `debug.nvaccel_surface_gpu_on=1` 时，WindowServer 不等 GPU 合成完成就交出画面，改由内核按标记等待。
+2026-11-21 已定位为 surface mark 的编号/transaction 边界缺失（见下节）；此前 `BUGS.md` B-58 的“等待有遗漏”只是现象。
+本机与撕裂无关：双缓冲打开、`surface_gpu_on=1` 时残影照样出现，并记录到一次 `debug.nvaccel_surface_gpu_timeouts`。
 
 - 绕过：`debug.nvaccel_surface_gpu_on=0`，并在 `/Library/GPUBundles/nvmtl/nvrm610.conf` 写入
   `NVMTL_WS_WAIT_COMPLETION=1`，让 WindowServer 自己等每次合成完成。`macos/display/install.sh` 两项都做。
 - 代价：WindowServer 每帧多等一次 GPU，帧率可能略低。
+
+### 2026-11-21：B-58 根因修复候选
+
+根因不是 GPU 慢，而是 surface completion mark 只有“每个 surface 一个 bit”的语义：WindowServer 的重叠 command buffer
+会共享同一个 pending 状态，已排队的 flip 因此会等待 transaction 之后提交的新 command buffer；超过 100 ms 后等待
+超时，scanout 继续读到未完成的旧 surface（鼠标残影、旧帧）。这也解释了为什么 `surface_gpu_on=0` 的同步等待可以
+让残影消失，但代价是主线程每帧多等约 4–6 ms。
+
+修复改为编号 mark：每个 `(surface, command buffer)` 分配递增编号，DisplayPipe transaction 入队时记录当前编号快照，
+flip 只等待 `<= 快照` 的 mark；后续 command buffer 不会延长当前 flip 的等待，超时也只丢弃本 transaction 范围内的
+mark。旧的无编号 ready 仍保留兼容语义。代码位于：
+
+- `nullarc-0.4.0-alpha/src/phxaccel/accel/nvrm-accel.cpp`
+- `nullarc-0.4.0-alpha/src/phxaccel/nvrm_surfshare_abi.h`
+- `nullarc-0.4.0-alpha/src/phxbringup/PhxBringup.cpp`
+- `capfix/nmplugin/NVMTLEventSync.m`、`capfix/nmplugin/nvmtl_vk.c`
+- 可复用补丁：`macos/nullarc/patches/phxaccel-surface-marks.patch`、`macos/nullarc/patches/nvmtl-surface-marks.patch`
+- 单元测试：`macos/nullarc/tests/test-surface-mark-seq.py`
+
+**尚未安装/重启验证**。一键安装器：`/Users/sfyyy/Documents/apple/work/install-surface-marks.command`（会备份、
+校验并安装三者，不自动重启）；回滚器：`rollback-surface-marks.command`。候选 kext 和插件均已原生编译；
+`test-surface-mark-seq.py` 验证了“后续 mark 不延长等待”、
+超时只清理旧 mark、512 槽和序号回绕。`wsnowait`、`surftest`、`desctest`、`carender` 在未安装插件路径下通过。
+验证通过后，`phxdisplay.sh` 才能把 `debug.nvaccel_surface_gpu_on` 改回 1，并删除 `NVMTL_WS_WAIT_COMPLETION=1`
+兜底。
 
 ## 锁屏动画、菜单、系统设置局部花屏 / 撕裂（已修复，待验证：`macos/display`）
 

@@ -1,0 +1,170 @@
+--- a/src/nmplugin/NVMTLEventSync.m
++++ b/src/nmplugin/NVMTLEventSync.m
+@@ -97,7 +97,9 @@
+     return atomic_load(&nvmtl_ws_marks_on) == 1;
+ }
+ static const void *const nvmtl_ws_marks_key = &nvmtl_ws_marks_key;
+-static void nvmtl_ws_mark(uint32_t sid, BOOL pending) { (void)nvmtl_vk_surface_gpu_mark(sid, pending); }
++// A pending call returns the kernel-assigned number; 0 means an older accelerator accepted only the legacy one-bit mark.
++static uint32_t nvmtl_ws_mark_surface_pending(uint32_t sid) { return nvmtl_vk_surface_gpu_mark_seq(sid, 1, 0); }
++static void nvmtl_ws_mark_surface_ready(uint32_t sid, uint32_t seq) { (void)nvmtl_vk_surface_gpu_mark_seq(sid, 0, seq); }
+ // Marking WindowServer's surfaces newest in VRAM at commit is only safe when NVAccel's page-off waits for a pending
+ // surface (NVAccelSurfaceWait). Without that wait a CPU lock or a copied present pages the surface off while the GPU
+ // is still drawing it: blank window panes, a torn band, a Dock without its icons. Such an accelerator (a package that
+@@ -114,19 +116,17 @@
+ }
+ // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
+ // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
+-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
++@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; NSMutableDictionary<NSNumber *, NSNumber *> *marks; BOOL early; } @end
+ @implementation NVMTLSurfaceHolds @end
+ // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
+ // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
+ @interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; __weak NVMTLCommandBuffer *owner; } @end
+ @implementation NVMTLDeferredPublication @end
+-// The kernel keeps one pending bit per surface, with no owner. WindowServer commits overlapping command buffers that
+-// write the same surface, so the holders are counted here and the kernel mark is released only when the last of them has
+-// finished with it; an older command buffer finishing first would otherwise release a surface the newer one still writes.
+-// With the early ordering nothing is published while its surface is still held. A dirtied texture's bookkeeping would
+-// call the surface current with another write in flight; a full publication (a private copy, or a texture whose commit
+-// mark was refused) locks the surface, and that lock's page-off would wait for a mark only this completion thread can
+-// release. Those textures wait in nvmtl_ws_deferred for the holder that releases the surface last.
++// WindowServer commits overlapping command buffers that write the same surface.  The kernel gives each pending call a
++// number, so a flip can wait only for the marks created before its own transaction; this command buffer's number is
++// kept here and released when its last part lands.  Holders still count private-image publications: a dirtied texture's
++// bookkeeping would call the surface current with another write in flight, so full copies wait in nvmtl_ws_deferred
++// for the holder that releases the surface last.  Direct VRAM surfaces do not need that publication barrier.
+ // The lock is its own, never the command-buffer class lock, and nothing that can wait for the accelerator runs under it:
+ // a page-off waiting for a mark holds the accelerator lock, and the release it waits for must always get through.
+ static NSCountedSet *nvmtl_ws_pending_holds;
+@@ -149,15 +149,36 @@
+         [waiting addObject:d];
+     }
+ }
+-// One holder lets go of a surface. The last one releases the kernel mark and moves the textures waiting for it to settled.
+-static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableArray *settled) {
++// A surface whose commit mark was accepted directly in its VRAM can release its own numbered mark as soon as this
++// command buffer's last part lands.  A private-image surface still waits for the last holder to publish its pixels.
++static BOOL nvmtl_ws_surface_direct(NVMTLCommandBuffer *cb, NVMTLSurfaceHolds *holds, uint32_t sid) {
++    BOOL any = NO;
++    for (NVMTLSubmissionPart *part in cb->_parts) {
++        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
++        for (NVMTLTexture *t in part->surfaces) {
++            if (!t->_surf || (uint32_t)IOSurfaceGetID(t->_surf) != sid) continue;
++            any = YES;
++            if (![holds->dirtied containsObject:t]) return NO;
++        }
++    }
++    return any;
++}
++// One holder lets go of a surface.  Direct surfaces release only this command buffer's numbered mark, so a flip can
++// stop waiting for work committed after it.  The last holder of a private-image surface still publishes before release.
++static void nvmtl_ws_release(NVMTLCommandBuffer *cb, NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableArray *settled) {
+     NSNumber *n = @(sid);
+     @synchronized (nvmtl_ws_lock()) {
+         if (![holds->ids containsObject:n]) return;
+         [holds->ids removeObject:n];
++        const BOOL direct = nvmtl_ws_surface_direct(cb, holds, sid);
++        NSNumber *token = holds->marks[n]; [holds->marks removeObjectForKey:n];
++        const uint32_t seq = token ? token.unsignedIntValue : 0u;
+         [nvmtl_ws_pending_holds removeObject:n];
++        // A zero token is an older accelerator with one mark per surface: it must stay until the last holder, or an
++        // older command buffer would clear a newer writer's mark.  Non-zero marks release independently.
++        if ((!direct || !seq) && [nvmtl_ws_pending_holds countForObject:n]) return;
++        nvmtl_ws_mark_surface_ready(sid, seq);
+         if ([nvmtl_ws_pending_holds countForObject:n]) return;
+-        nvmtl_ws_mark(sid, NO);
+         NSArray *waiting = nvmtl_ws_deferred[n];
+         if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
+     }
+@@ -202,7 +223,7 @@
+     }
+     if (!ids) return;
+     NVMTLSurfaceHolds *holds = [NVMTLSurfaceHolds new];
+-    holds->ids = ids; holds->early = nvmtl_ws_surface_wait();
++    holds->ids = ids; holds->early = nvmtl_ws_surface_wait(); holds->marks = [NSMutableDictionary new];
+     if (holds->early) {
+         NSMutableSet *dirtied = [NSMutableSet new];
+         for (NVMTLSubmissionPart *part in cb->_parts) {
+@@ -214,7 +235,12 @@
+     }
+     @synchronized (nvmtl_ws_lock()) {
+         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
+-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES); }
++        for (NSNumber *n in ids) {
++            [nvmtl_ws_pending_holds addObject:n];
++            const uint32_t token = nvmtl_ws_mark_surface_pending(n.unsignedIntValue);
++            if (token & 0x80000000u) { static unsigned refused; if (refused++ < 4) nvlog("WindowServer mark surface %u refused (%#x): %s", n.unsignedIntValue, token, refused < 4 ? "copying through the fallback semantics" : "more refusals"); }
++            holds->marks[n] = @(token);
++        }
+     }
+     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ }
+@@ -243,7 +269,7 @@
+         }
+         if (!later) [last addObject:@(sid)];
+     }
+-    for (NSNumber *n in last) nvmtl_ws_release(holds, n.unsignedIntValue, settled);
++    for (NSNumber *n in last) nvmtl_ws_release(cb, holds, n.unsignedIntValue, settled);
+     return publish;
+ }
+ // The command buffer has finished (or failed): every hold it still has is released, and what was waiting is published.
+@@ -252,7 +278,7 @@
+     if (!holds) return;
+     NSArray *ids; @synchronized (nvmtl_ws_lock()) { ids = holds->ids.allObjects; }
+     NSMutableArray *settled = [NSMutableArray new];
+-    for (NSNumber *n in ids) nvmtl_ws_release(holds, n.unsignedIntValue, settled);
++    for (NSNumber *n in ids) nvmtl_ws_release(cb, holds, n.unsignedIntValue, settled);
+     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+     (void)nvmtl_ws_publish_settled(settled, nil);
+ }
+--- a/src/nmplugin/nvmtl_vk.c
++++ b/src/nmplugin/nvmtl_vk.c
+@@ -1955,15 +1955,32 @@
+     if (IOServiceOpen(s, mach_task_self(), 0x4E34384Eu, &g_phx_mark_conn) != KERN_SUCCESS) g_phx_mark_conn = 0;
+     IOObjectRelease(s);
+ }
+-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape or PhxBringup's: 0 = the kernel took it
+-uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
++// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape or PhxBringup's.  Pending returns the
++// numbered mark the kernel assigned; ready sends it back.  A zero/old-kernel answer keeps the legacy one-bit meaning.
++#define NVMTL_GPU_MARK      0x80000000u
++#define NVMTL_GPU_SEQ_SHIFT 2u
++#define NVMTL_GPU_SEQ_MASK  0x3ffffffcu
++uint32_t nvmtl_vk_surface_gpu_mark_seq(uint32_t surfaceID, int pending, uint32_t seq)
+ {
+-    if (pnvk_surface_dirty && g_dev) return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
++    const uint32_t plane = NVMTL_GPU_MARK | (pending ? 1u : 0u) |
++                           ((seq << NVMTL_GPU_SEQ_SHIFT) & NVMTL_GPU_SEQ_MASK);
++    if (pnvk_surface_dirty && g_dev) return pnvk_surface_dirty(g_dev, surfaceID, plane);
+     pthread_once(&g_phx_mark_once, nvmtl_phx_mark_open);
+     if (!g_phx_mark_conn) return 0x80000002u;
+-    uint64_t in[2] = { surfaceID, pending ? 1u : 0u }, out = 0x80000002u; uint32_t n = 1;
+-    if (IOConnectCallScalarMethod(g_phx_mark_conn, 22, in, 2, &out, &n) != KERN_SUCCESS) return 0x80000002u;
++    uint64_t in[3] = { surfaceID, pending ? 1u : 0u, seq }, out = 0x80000002u; uint32_t n = 1;
++    // New PhxBringup accepts the third scalar and assigns/returns the number.  Older builds reject the shape; fall
++    // back to the legacy two-scalar call rather than losing the kernel wait entirely.
++    kern_return_t kr = IOConnectCallScalarMethod(g_phx_mark_conn, 22, in, 3, &out, &n);
++    if (kr != KERN_SUCCESS) {
++        out = 0x80000002u; n = 1;
++        kr = IOConnectCallScalarMethod(g_phx_mark_conn, 22, in, 2, &out, &n);
++        if (kr != KERN_SUCCESS) return 0x80000002u;
++    }
+     return (uint32_t)out;
++}
++uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
++{
++    return nvmtl_vk_surface_gpu_mark_seq(surfaceID, pending, 0);
+ }
+ /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
+ int nvmtl_vk_accel_surface_wait(void)
+--- a/src/nmplugin/nvmtl_vk.h
++++ b/src/nmplugin/nvmtl_vk.h
+@@ -361,4 +361,7 @@
+ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
+ int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
+ uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
++/* Numbered WindowServer completion mark: pending with seq 0 asks the kernel to assign a number and returns it;
++ * ready sends the number back so only that command buffer's mark is released.  0/error is the old kernel path. */
++uint32_t nvmtl_vk_surface_gpu_mark_seq(uint32_t surfaceID, int pending, uint32_t seq);
+ int nvmtl_vk_accel_surface_wait(void);
