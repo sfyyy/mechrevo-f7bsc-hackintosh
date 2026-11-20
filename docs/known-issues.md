@@ -99,7 +99,7 @@ Info.plist 保持 F7BSC 版）：
 页表满时内核日志会出现 `PhxBringup: GPU page tables of context N full`。同一份原版源码用本机 CLT 编译，与 nullarc
 0.4.0 发布的二进制逐字节一致，说明补丁之外没有引入编译差异。验证：`tests/vkprobe/vkheap`（看堆大小）、`vkfill 0 2`。
 
-## 调用 Vision 文字识别的程序启动即崩溃（nullarc 驱动 bug，已绕过 Shottr，待从源码修复）
+## 调用 Vision 识别（文字、二维码）的程序崩溃（nullarc 驱动 bug，已修复：`patches/nvmtl-nn-hide.patch`，已安装）
 
 2026-11-18 11:27–11:28，Shottr 1.10.0 连续 3 次启动即退出（`SIGABRT`，Abort trap: 6）。Shottr 启动时会调用 Vision 的
 `VNRecognizeTextRequest`（OCR）。崩溃线程：
@@ -149,6 +149,52 @@ MPSNeuralNetwork 的 metallib（上游 B-15：这些神经网络内核会让 780
 3. 根治 GPU 挂起，让神经网络内核真正在 780M 上运行：涉及闭源翻译器（参见上游 B-15、B-29），工作量大。
 
 验证标准：`vision-ocr` 与 `vision-ocr cpu` 均打印 `ok=1` 并以 0 退出；把 `Shottr` 移出 `DENY` 后 Shottr 能启动、OCR 正常，且仍在使用 GPU。
+
+2026-11-19 QQ 7.0.3 同样崩溃 5 次：QQ 主进程的 `QBAR_THREAD`（`scanQBar`，识别图片里的二维码）调用
+`VNDetectBarcodesRequest`，堆栈相同，只是入口是 Vision 的条码检测器。2026-11-20 临时把 `QQ` 也加进 `DENY`。
+
+**修复（方向 1，2026-11-20）**：`patches/nvmtl-nn-hide.patch`（新文件 `src/nmplugin/nvmtl_nn_hide.h`，在
+`initWithAcceleratorPort:` 设备建好后安装）。只让推理栈看不到 GPU，程序自己的 Metal 照常用 780M。逆向结果：
+
+- Vision 从 Core ML 的 `MLAllComputeDevices()` 选计算设备，它读 `-[MLGPUComputeDeviceRegistry registeredComputeDevices]`；
+  这个注册表由 Core ML 调 `MTLCopyAllDevicesWithObserver` 建立。Vision 选了 GPU，就让 Espresso 建 MPS 上下文（引擎 5）。
+- Espresso 自己通过 `MTLCopyAllDevices`、`MTLCreateSystemDefaultDevice`、`MPSGetPreferredDevice` 取设备。
+  CPU 计划在 `cpu_context_transfer_algo_t::is_kernel_registered_on_engine` 中用这个设备注册 MPS 内核，这就是
+  `usesCPUOnly` 也会崩的原因。
+- 共享缓存（x86_64）里各 dylib 调用这些函数都经过自己的 `__stubs`（`jmp *slot(%rip)`），但槽位在缓存统一的 GOT 中，
+  每个符号只有一个槽，所有 dylib 共用。所以不能只改 Espresso 的槽。
+
+做法：
+
+1. Core ML：替换 `-[MLGPUComputeDeviceRegistry registeredComputeDevices]`，返回空数组。插件加载前已建好的注册表也会
+   失效，因为 `MLAllComputeDevices()` 每次都重新读它。同时，从 Core ML 代码发出的 `MTLCopyAllDevicesWithObserver`
+   调用也返回空列表（观察者照常注册）。这一条覆盖 Core ML 在插件之后才加载的情况：dyld 报告镜像时它的 ObjC 类还没
+   注册，所以由这次调用来完成上面的方法替换。
+2. Espresso：上面三个查询函数的共享 GOT 槽换成包装函数。包装函数只在返回地址落在 Espresso 的 `__TEXT` 内时回答
+   「没有设备」，其它调用方原样转发给真函数。
+
+于是 Vision 和 Core ML 在 CPU 上做推理，不再加载 MPSNeuralNetwork 库；`nvmtl_nn_library()` 的拒绝仍然保留作为兜底。
+WindowServer 不安装这些钩子；`NVMTL_ALLOW_NN=1` 时整个功能关闭。
+
+验证（未安装，`tests/runp.sh` 加载）：`tests/vision-nn.m` 的 5 种模式全部以 0 退出，并且确实识别出内容（二维码
+`https://www.qq.com`，OCR 读出 `Hello Vision 12345`）：Vision 是进程里第一个用 Metal 的、程序先建设备、Vision 用
+dlopen 后加载、OCR 默认、OCR `usesCPUOnly`。程序自己的设备仍是 780M（`MTLCopyAllDevices=1`，命令缓冲状态 4）。
+已安装的旧插件下，这些模式全部以 134 退出。`carender` 600 帧 × 40 层 PASS，0 错像素，耗时与旧插件相同。
+编译基线：去掉 MPS 能力候选改动后的源码，编译结果与已安装插件逐字节一致（`7cecd00b`），因此本补丁是唯一差别。
+
+安装：`sudo bash work/install-nnhide.sh`。它替换插件，并把 `QQ`、`Shottr` 移出拒绝名单（`nvmtl-allow.txt` 与
+`phxboot.sh` 的 `DENY`，`phxboot.sh` 恢复到加 Shottr 之前的原样）。新启动的程序立即生效，WindowServer 重启后才换新插件。
+撤销：`sudo bash work/rollback-nnhide.sh`。
+
+已安装（2026-11-20 11:31，11:43 重启）：安装后的插件除代码签名外与 `NVMTLDriver.nnhide` 逐字节一致。重启后，用已安装
+插件直接运行（不经 runp）`vision-nn` 的 5 种模式与 Swift 二维码复现，全部识别成功并以 0 退出。系统日志中，QQ 与 Shottr
+均为 `allow-listed`（有 GPU），并出现三行 `nn-hide` 安装记录。Shottr 启动时做 OCR，日志显示推理栈请求设备被答复「无」，
+随后正常运行，没有崩溃报告。WindowServer 自重启后没有新的崩溃。
+用户验收（11:48）：在 QQ 里识别图片二维码成功，没有闪退。日志中 QQ 主进程有一行「推理栈请求设备 → 答复无，改在 CPU 上进行」。
+
+仍未覆盖（只有兜底的断言）：程序直接用 MPSNeuralNetwork / MPSCNN（不经 Espresso）；程序手动把 780M 设备交给 Core ML
+（`MLModelConfiguration.preferredMetalDevice`）；以及插件加载之前 Espresso 就已经取到了设备（插件加载发生在进程第一次
+枚举设备时，Vision 和 Core ML 的流程里这一步总是 Core ML 的注册表先做，所以实测不会出现）。
 
 ## Chrome 等程序卡顿，WindowServer 占满一个核（已修复：`patches/nvmtl-surface-key.patch` + `nvmtl-perf2-surface-in.patch`，尚无安装脚本）
 
