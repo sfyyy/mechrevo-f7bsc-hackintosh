@@ -37,8 +37,8 @@ chmod +x "$SIM/bin/"*
 
 plist() { printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' "$*"; }
 plist '<plist version="1.0"><dict><key>AllDisksAndPartitions</key><array><dict><key>Partitions</key><array><dict><key>Content</key><string>EFI</string><key>DeviceIdentifier</key><string>disk9s1</string></dict></array></dict></array></dict></plist>' > "$SIM/state/list.plist"
-plist '<plist version="1.0"><dict><key>MountPoint</key><string>'"$SIM"'/esp</string></dict></plist>' > "$SIM/state/info_mounted.plist"
-plist '<plist version="1.0"><dict><key>MountPoint</key><string></string></dict></plist>' > "$SIM/state/info_unmounted.plist"
+plist '<plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk9s1</string><key>DiskUUID</key><string>89B78469-B651-499B-962F-025836588DC8</string><key>MountPoint</key><string>'"$SIM"'/esp</string></dict></plist>' > "$SIM/state/info_mounted.plist"
+plist '<plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk9s1</string><key>DiskUUID</key><string>89B78469-B651-499B-962F-025836588DC8</string><key>MountPoint</key><string></string></dict></plist>' > "$SIM/state/info_unmounted.plist"
 
 # rewrite a script: no root check, private PATH, scratch ESP/G, HERE where the installer expects it
 rewrite() {
@@ -60,6 +60,7 @@ mkdir -p "$SIM/fakegpu/fw" "$SIM/esp/EFI/OC/Kexts" "$SIM/nullarc-0.4.0-alpha/too
 cp -R "$WORK/PhxBringup-vcn.kext" "$SIM/"
 cp -R "$WORK/vcn-ref" "$SIM/"
 cp "$WORK/nullarc-0.4.0-alpha/tools/phxctl/vcnctl.c" "$SIM/nullarc-0.4.0-alpha/tools/phxctl/"
+cp "$WORK/nullarc-0.4.0-alpha/tools/phxctl/vcn_frame_check.c" "$SIM/nullarc-0.4.0-alpha/tools/phxctl/"
 cp -R "$WORK/PhxBringup-vcn.kext" "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext"
 echo old > "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext/Contents/OLD_MARKER"
 cp "$WORK/mechrevo-f7bsc-hackintosh/EFI/OC/config.plist" "$SIM/esp/EFI/OC/config.plist"
@@ -90,6 +91,29 @@ clang -O2 -Wall -Wextra -Werror "$SIM/nullarc-0.4.0-alpha/tools/phxctl/vcnctl.c"
 VCN_TEST_FIRMWARE="$WORK/vcn-ref/vcn_4_0_0.bin" "$SIM/vcnctl-mock" init "$WORK/vcn-ref/vcn_4_0_0.bin" \
     >"$SIM/mock-init.log" || fail "vcnctl HELLO/stage/init"
 grep -q '^init: code 0 ' "$SIM/mock-init.log" || fail "vcnctl did not complete init"
+VCN_TEST_BUILD=61 VCN_TEST_FIRMWARE="$WORK/vcn-ref/vcn_4_0_0.bin" "$SIM/vcnctl-mock" init "$WORK/vcn-ref/vcn_4_0_0.bin" >/dev/null || fail "build 61 default DPG flags"
+VCN_TEST_BUILD=61 VCN_TEST_STATIC=1 VCN_TEST_FIRMWARE="$WORK/vcn-ref/vcn_4_0_0.bin" "$SIM/vcnctl-mock" init --static "$WORK/vcn-ref/vcn_4_0_0.bin" >/dev/null || fail "static diagnostic"
+for op in decode-session encode-session; do
+    VCN_TEST_BUILD=61 "$SIM/vcnctl-mock" "$op" >/dev/null || fail "$op completion"
+    if VCN_TEST_BUILD=61 VCN_TEST_STALE_FENCE=1 "$SIM/vcnctl-mock" "$op" >/dev/null; then fail "$op stale fence"; fi
+done
+
+export VCN_TEST_FRAME="$WORK/nullarc-0.4.0-alpha/src/phxbringup/tests/vcn_quadrants.h264"
+"$SIM/fakegpu/vcn_frame_check" "$VCN_TEST_FRAME" || fail "software AVC reference pattern"
+if "$SIM/fakegpu/vcn_frame_check" "$SIM/truncated-fw.bin" >/dev/null 2>&1; then fail "accepted invalid AVC"; fi
+for op in decode-frame encode-frame; do
+    VCN_TEST_BUILD=62 "$SIM/vcnctl-mock" "$op" "$SIM/frame" >/dev/null || fail "$op output"
+    if [ "$op" = decode-frame ]; then length=737280; else length=$(wc -c < "$VCN_TEST_FRAME"); fi
+    [ "$(wc -c < "$SIM/frame")" -eq "$length" ] || fail "$op output size"
+    echo sentinel > "$SIM/frame"
+    for fault in STALE_FENCE BAD_LENGTH BAD_PAYLOAD BAD_PHASE; do
+        if env VCN_TEST_BUILD=62 "VCN_TEST_$fault=1" "$SIM/vcnctl-mock" "$op" "$SIM/frame" >/dev/null 2>&1; then
+            fail "$op accepted $fault"
+        fi
+        [ "$(cat "$SIM/frame")" = sentinel ] || fail "$op replaced output on failure"
+    done
+    if VCN_TEST_BUILD=61 "$SIM/vcnctl-mock" "$op" >/dev/null 2>&1; then fail "$op accepted build 61"; fi
+done
 
 bash "$SIM/install.sh" --dry-run >/dev/null || fail "install --dry-run"
 bash "$SIM/install.sh" >/dev/null || fail "install"
@@ -118,11 +142,17 @@ case "$1" in
   check-firmware) [ "${SIM_FAIL_OP:-}" != check-firmware ] ;;
   status) [ "${SIM_FAIL_OP:-}" != status ] || exit 1; echo "VCN: down" ;;
   init) [ "$2" = "--tmr" ] && echo "init tmr=$3" || echo "init file=$2" ;;
-  ring|fence) [ "$1" != "${SIM_FAIL_OP:-}" ] || exit 1; echo "$1 ok" ;;
+  encode-frame) [ "$1" != "${SIM_FAIL_OP:-}" ] || exit 1; cp "$VCN_TEST_FRAME" "$2" ;;
+  decode-frame) [ "$1" != "${SIM_FAIL_OP:-}" ] || exit 1; touch "$2" ;;
+  ring|fence|decode-session|encode-session) [ "$1" != "${SIM_FAIL_OP:-}" ] || exit 1; echo "$1 ok" ;;
+  crumbs) echo "diagnostic breadcrumbs" ;;
   down) echo "down: code 0" ;;
+  *) echo "unexpected vcnctl command: $1" >&2; exit 2 ;;
 esac
 EOF
 chmod +x "$SIM/fakegpu/vcnctl"
+mkdir -p "$SIM/vcntest"
+cp "$SIM/fakegpu/vcnctl" "$SIM/vcntest/vcnctl"
 rewrite "$WORK/vcn-test.sh" "$SIM" "$SIM/fakegpu" "$SIM/vcn-test.sh"
 chmod +x "$SIM/vcn-test.sh"
 bash -n "$SIM/vcn-test.sh"
@@ -130,6 +160,20 @@ rm -f "$SIM/calls.log"; bash "$SIM/vcn-test.sh" >/dev/null || fail "vcn-test nor
 grep -q '^CALL init /' "$SIM/calls.log" || fail "normal path did not call init"
 grep -q '^CALL fence 6' "$SIM/calls.log" || fail "fence not called"
 grep -q '^CALL down' "$SIM/calls.log" || fail "power down not called"
+rm -f "$SIM/calls.log"; SIM_BUILD=61 bash "$SIM/vcn-test.sh" >/dev/null || fail "build 61 session tests"
+grep -q '^CALL decode-session' "$SIM/calls.log" || fail "decode-session missing"
+grep -q '^CALL encode-session' "$SIM/calls.log" || fail "encode-session missing"
+for build in 62 63 64; do
+    rm -f "$SIM/calls.log"
+    SIM_BUILD="$build" bash "$SIM/vcn-test.sh" >/dev/null || fail "build $build frames"
+    for op in decode-frame encode-frame; do
+        grep -q "^CALL $op " "$SIM/calls.log" || fail "build $build skipped $op"
+    done
+done
+rm -f "$SIM/calls.log"
+if SIM_BUILD=63 SIM_FAIL_OP=decode-frame bash "$SIM/vcn-test.sh" >/dev/null; then fail "decode frame failure"; fi
+if grep -q '^CALL encode-frame' "$SIM/calls.log"; then fail "encoded after decode failed"; fi
+grep -q '^CALL down' "$SIM/calls.log" || fail "failed frame did not power down"
 rm -f "$SIM/calls.log"; touch "$SIM/fakegpu/vcn-fw-at-boot"
 { echo 'loadfw x fwtype 13 @fwbuf+0x900000 -> kr 0x00000000  status 0x00000000  10 us  fw_addr 0x0000008008C00000'
   echo 'loadfw x fwtype 13 @fwbuf+0x900000 -> kr 0x00000000  status 0x00000001  10 us  fw_addr 0x0000008008E00000'

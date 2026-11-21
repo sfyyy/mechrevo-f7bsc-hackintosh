@@ -27,6 +27,14 @@ REG_MAP = {
     "kRegLmiCtrl2": "UVD_LMI_CTRL2",
     "kRegSoftReset": "UVD_SOFT_RESET",
     "kRegLmiCtrl": "UVD_LMI_CTRL",
+    "kRegScratch1": "UVD_SCRATCH1",
+    "kRegDpgLmaCtl": "UVD_DPG_LMA_CTL",
+    "kRegDpgLmaData": "UVD_DPG_LMA_DATA",
+    "kRegDpgLmaMask": "UVD_DPG_LMA_MASK",
+    "kRegCgcGate": "UVD_CGC_GATE",
+    "kRegCgcCtrl": "UVD_CGC_CTRL",
+    "kRegSuvdCgcGate": "UVD_SUVD_CGC_GATE",
+    "kRegSuvdCgcCtrl": "UVD_SUVD_CGC_CTRL",
     "kRegMpcCntl": "UVD_MPC_CNTL",
     "kRegMpcSetMuxA0": "UVD_MPC_SET_MUXA0",
     "kRegMpcSetMuxB0": "UVD_MPC_SET_MUXB0",
@@ -66,10 +74,12 @@ MASK_MAP = {
     "kLmiCtrl2StallUmc": "UVD_LMI_CTRL2__STALL_ARB_UMC_MASK",
     "kSoftResetLmi": "UVD_SOFT_RESET__LMI_SOFT_RESET_MASK",
     "kSoftResetLmiUmc": "UVD_SOFT_RESET__LMI_UMC_SOFT_RESET_MASK",
+    "kCgcCtrlDynMode": "UVD_CGC_CTRL__DYN_CLOCK_MODE_MASK",
     "kMpcCntlReplMask": "UVD_MPC_CNTL__REPLACEMENT_MODE_MASK",
     "kRbArbCtrlVcpuDis": "UVD_RB_ARB_CTRL__VCPU_DIS_MASK",
     "kRb1DbCtrlEn": "VCN_RB1_DB_CTRL__EN_MASK",
     "kRbEnableRb1": "VCN_RB_ENABLE__RB1_EN_MASK",
+    "kPowerStatusMask": "UVD_POWER_STATUS__UVD_POWER_STATUS_MASK",
     "kUvdStatusVcpuRdy": "UVD_STATUS__VCPU_REPORT__SHIFT",   # compared as 1 << shift below
 }
 
@@ -77,11 +87,15 @@ MASK_MAP = {
 VALUE_MAP = {
     "kPgfsmStatusMask": "PGFSM_WAIT_MASK",
     "kUvdStatusBusy": "UVD_STATUS__UVD_BUSY",
-    "kPgfsmPoweredNoPg": "UVD_PGFSM_STATUS__UVDM_UVDU_UVDLM_PWR_ON_3_0",
+    "kPgfsmPoweredPg": "UVD_PGFSM_STATUS__UVDM_UVDU_UVDLM_PWR_ON_3_0",
+    "kPgfsmPoweredNoPg": "PGFSM_POWERED_NO_PG",
+    "kPgfsmConfigGate": "PGFSM_CONFIG_GATE",
+    "kPgfsmGated": "PGFSM_GATED",
     "kPgfsmConfigNoPg": "PGFSM_CONFIG_NO_PG",
     "kPgfsmConfigPg": "PGFSM_CONFIG_PG",
     "kPowerStatusKeep": "POWER_STATUS_KEEP",
     "kPowerStatusPgOn": "POWER_STATUS_PG_ON",
+    "kPowerStatusTilesOff": "POWER_STATUS_ANTI_HANG_OFF",
     "kMpcSetMuxA": "MPC_SET_MUXA",
     "kMpcSetMuxB": "MPC_SET_MUXB",
     "kMpcSetMux": "MPC_SET_MUX",
@@ -105,7 +119,7 @@ def parse_header(path):
     consts = {}
     for m in re.finditer(r"constexpr\s+uint32_t\s+(\w+)\s*=\s*([^;]+);", src):
         name, expr = m.group(1), m.group(2)
-        expr = expr.replace("u", "").replace("U", "").strip()
+        expr = re.sub(r"(?<=[0-9a-fA-F])[uU]\b", "", expr).strip()
         for known, value in consts.items():
             expr = re.sub(r"\b%s\b" % known, str(value), expr)
         try:
@@ -175,10 +189,21 @@ def main():
         want(name, consts[name], expected)
 
     # constants with no Linux counterpart are derived; pin them so an edit is visible
-    want("kPgfsmPoweredPg", consts.get("kPgfsmPoweredPg"), 0)
+    want("kPgfsmPoweredNoPg", consts.get("kPgfsmPoweredNoPg"), 0)
+    want("kPgfsmPoweredPg", consts.get("kPgfsmPoweredPg"), 0x2A2A8AA0)
     want("kMpcCntlReplShift", consts.get("kMpcCntlReplShift"), 3)
     want("kMpcCntlReplMode", consts.get("kMpcCntlReplMode"), 2)
     want("kRb1DbCtrlOffsetShift", consts.get("kRb1DbCtrlOffsetShift"), 2)
+    want("kRb1DbCtrlEn", consts.get("kRb1DbCtrlEn"), 0x40000000)
+    want("kDbRangeStart", consts.get("kDbRangeStart"), 0x310)
+    want("kDbRangeCount", consts.get("kDbRangeCount"), 8)
+    want("kVcnDoorbellRange", consts.get("kVcnDoorbellRange"), 0x00080C40)
+    want("kDbIndexLinux", consts.get("kDbIndexLinux"), 0x312)
+    want("kVcnDoorbellRangeAddr", consts.get("kVcnDoorbellRangeAddr"), 0x01403BCC)
+    want("kRsmuIndex", consts.get("kRsmuIndex"), 0x14)
+    want("kDoorbellApertureReg", consts.get("kDoorbellApertureReg"), 0xDE0)
+    want("kVcnDoorbellFields", consts.get("kVcnDoorbellFields"), 0x001F0FFC)
+    want("kRsmuData", consts.get("kRsmuData"), 0x15)
     want("kFwFlagUnifiedQueue", consts.get("kFwFlagUnifiedQueue"), 1 << 2)
     want("kFwFlagDrmKeyInject", consts.get("kFwFlagDrmKeyInject"), 1 << 4)
     want("kFwFlagSmuDpm", consts.get("kFwFlagSmuDpm"), 1 << 11)

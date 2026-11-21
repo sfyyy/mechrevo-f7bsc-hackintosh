@@ -583,10 +583,11 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 属于驱动整体性能工作，暂不继续；先做 VCN。临时缓解：投屏时少开最大化、带半透明侧栏的窗口。
 关掉统计：从 `nvrm610.conf` 删掉 `NVMTL_WS_GPUTIME=1`（关掉后零开销，重启生效）。
 
-## Radeon 780M 的 H.264 / HEVC 硬件编解码仍未接入 VideoToolbox
+## Radeon 780M 的应用硬编码需要进程内注册
 
 - 腾讯会议启动时记录 `no hw h264 encoder ablity` 和 `no hw hevc encoder ablity`，软件编码 2560×1440 HEVC 时 CPU 温度曾达 88–91 °C。向日葵远控日志报告 `support hevc 0`。
-- 当前加载 PhxBringup build 59（VCN 诊断版），安装的 RADV 只报告图形、计算和传输相关队列。VideoToolbox 硬件验收中，H.264 和 HEVC 的编码器均返回 `-12908`，解码器均返回 `-12906`。
+- PhxBringup build 64 真机验收通过。普通用户程序注册 Phoenix 编码器后，VideoToolbox 完成了八帧 160×128 H.264 硬编码，独立软件解码通过亮度和色度校验。[接入说明](../macos/nullarc/vcn/README.md)
+- 全新进程未经注册直接要求系统硬件时，H.264 和 HEVC 的编码会话仍返回 `-12908`，解码会话仍返回 `-12906`。应用硬解码和 HEVC 仍待实现。
 
 ### PhxBringup build 59：VCN 固件仍未能启动（2026-11-22 暂停）
 
@@ -602,8 +603,7 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 途中修掉的真实缺陷：`--fw-type` 原先根本没有传进 kext（应为 `>>16` 而非 `>>24`）；
 `vcnctl toc` 送的是整个 2560 字节文件而非 2304 字节载荷——修正后 PSP **接受 LOAD_TOC（status 0）**。
 
-完整断点、已排除项清单、复现脚本与后续待办见 [VCN NEXT](../macos/nullarc/vcn/NEXT.md)。
-里程碑：固件运行（`SCRATCH1 = 0x09118010`）→ `vcnctl fence` 通过，之后才谈编解码指令流与 VideoToolbox 注册。
+后续版本已完成固件启动和队列回绕测试。历次实测与结果见 [VCN 真机记录](../macos/nullarc/vcn/NEXT.md)。
 
 ## 没有 HiDPI
 

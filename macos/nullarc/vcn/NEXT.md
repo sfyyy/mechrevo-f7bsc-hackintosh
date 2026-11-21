@@ -1,3 +1,36 @@
+# Radeon 780M VCN 4.0.2 真机结果
+
+## build 64 · 2026-11-22
+
+重启后 IORegistry 报告 `phx-build = 64`。已加载的 PhxBringup 可执行文件与仓库 EFI 二进制的 Mach-O UUID 均为 `3F78DC1A-721E-35EB-AFBE-62C9DC7D7D1F`。测试开始时 VCN 已下电，随后使用 `vcn-test.sh --keep` 初始化并保持上电，应用测试以普通用户运行。
+
+| 真机用例 | 结果 |
+| --- | --- |
+| 应用注册 Phoenix H.264 编码器 | `--phx-avc` 通过 8/8 帧。会话使用 `org.nullarc.phoenix.avc.encoder` 并报告硬件编码。独立软件解码逐帧校验了时间戳和八组不同的 160×128 NV12 亮度、Cb、Cr 图案。 |
+| 底层队列与会话 | 固件启动、四次 END、六次 fence（含回绕）和两种会话均通过。 |
+| 固定 H.264 帧 | 解码 fence 14 完成，NV12 输出 737280 字节，字节和为 `0x020345d8`。编码 fence 17 完成，正常导出 136 字节，软件解码后的四象限校验通过。 |
+| 应用未经注册直接要求硬件 | H.264、HEVC 的系统编码会话返回 `-12908`，解码会话返回 `-12906`。 |
+
+测试结束后 VCN 正常下电。复现命令见 [应用接入和验收说明](README.md)。其他分辨率、应用硬解码、HEVC 和系统级发现仍待实现。
+
+## build 62 · 2026-11-22
+
+重启后 IORegistry 确认加载 PhxBringup build 62。固件初始化成功，四次 END、六次 fence（包含队列回绕）、解码会话和编码会话均通过。测试退出时已将 VCN 下电。
+
+| 诊断 | 真机结果 |
+| --- | --- |
+| H.264 单帧硬解 | 864×480 NV12，行跨度 1024。生成 737280 字节，字节和为预期的 `0x020345d8`，fence 14 完成。 |
+| H.264 单帧硬编 | fence 16 完成，硬件生成 136 字节 Annex B 码流。独立软件解码得到预期的 160×128 亮度四象限和中性色度。 |
+| VideoToolbox | H.264、HEVC 硬件编码会话创建返回 -12908，硬件解码会话创建返回 -12906。软件对照两种格式各通过 8 帧往返。底层 HEVC 帧命令仍待实现。 |
+
+build 62 的 `encode-frame` 因固件反馈 DWORD 8 为 5 而拒绝导出，导致脚本退出 1。按 DWORD 6 中的长度 136 从显存的码流缓冲区起点取回数据，SPS、PPS 和 IDR 分别从偏移 0、17、25 开始。运行日志和原始输入保存在工作目录的 `vcntest/results/build62-NdR6Ba96/`，其中 `feedback.hex`、`stream.hex`、`recovered.h264` 和 `recovered-check.log` 可用于复核。
+
+build 62 所在 OpenCore ESP 分区 UUID 为 72CA6637-9804-4FDE-A316-6905B904ECFA，kext 可执行文件 SHA-256 为 91ee5a18a75005f0c743a810b316da33e615acdf2eb9b72dd3a5acf5e50402ed。安装前备份位于 `/Users/Shared/gpu/backup/vcn-20261122-033140/PhxBringup.kext`，回滚入口为工作目录的 `rollback-vcn.sh`。
+
+## 旧启动路径排查记录
+
+以下内容保留自较早 build 59 的 PSP 启动诊断，作为历史记录。build 61 补上了其间发现的启动列表字段和队列路径缺陷。早期的“固件始终没跑起来”等描述不能代替 build 61 真机结果。
+
 # VCN 4.0.2 bring-up — 断点记录（2026-11-22 收尾，暂停）
 
 ## 状态一句话

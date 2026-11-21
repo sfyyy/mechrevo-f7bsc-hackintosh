@@ -1,6 +1,54 @@
 # Radeon 780M 视频编解码
 
-[PhxBringup build 37 补丁](../patches/phxbringup-vcn.patch) 基于 pristine nullarc 0.4.0-alpha，包含 build 35 的页表上限修复。selector 120 提供 VCN 4.0.2 固件及统一队列诊断，需要 root 和现有的 phxdebug=1。当前工作区的 build 37 已编译并通过依赖检查，运行中的机器仍是 build 35。
+2026-11-22，本机重启加载 PhxBringup build 64 后，普通用户通过 VideoToolbox 的 Phoenix 编码器完成了八帧 160×128 H.264 硬编码。独立软件解码器按时间戳逐帧核对了各帧特有的亮度和色度图案。驱动诊断还通过了 864×480 H.264 固定帧硬解和 136 字节 IDR 的正常导出。初始化和底层诊断使用 selector 120，需要 root 和启动参数 `phxdebug=1`。[真机记录](NEXT.md)
+
+build 64 增加了应用提交 NV12 帧的接口。驱动源码与参考向量见 [build 64 补丁](../patches/phxbringup-vcn.patch)。VideoToolbox 进程内编码器与验收程序位于本目录。
+
+## 应用接入 H.264 编码
+
+在 x86_64 应用中一同编译 `phx_vt.c`、`phx_avc.c` 和 `phx_avc_io.c`。启动时调用 `PhxRegisterAVCEncoder()`，成功后使用 `VTCompressionSessionCreate` 创建 H.264 会话。编码器说明字典中将 `kVTVideoEncoderSpecification_EncoderID` 设为 `PhxAVCEncoderID`，将 `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` 设为 `kCFBooleanTrue`。可运行示例见 [vt_roundtrip.c](vt_roundtrip.c) 的 `--phx-avc` 入口。
+
+输入为 160×128 的视频范围 NV12。每帧生成一张独立 IDR，回调返回带输入时间戳和时长的 AVC 样本。每个使用该编码器的进程都需要注册。注册使用了 macOS 私有接口，目前只在 x86_64 macOS 26.7.1 验证过。HEVC、应用硬解码、其他分辨率以及第三方应用的系统级发现仍待实现。
+
+本机工作目录的 `vcntest/phx-vt-roundtrip` 已编译，可在重启后直接运行。也可在本目录重新编译：
+
+    clang -std=c11 -O2 -Wall -Wextra -Werror -DPHX_VT_ENCODER \
+        vt_roundtrip.c phx_vt.c phx_avc.c phx_avc_io.c \
+        -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+        -framework CoreFoundation -framework IOKit -o /tmp/phx-vt-roundtrip
+
+在工作目录运行 `sudo bash install-vcn.sh` 部署 build 64。重启后确认 `phx-build` 为 64，再运行以下命令。初始化使用现有的 root 诊断入口，随后以普通用户运行应用。休眠后需要重新初始化。
+
+    ioreg -r -c PhxBringup -d 1 | grep phx-build
+    sudo bash vcn-test.sh --keep
+    /tmp/phx-vt-roundtrip --phx-avc
+    sudo /Users/Shared/gpu/vcnctl down
+
+验收程序检查会话实际选择的编码器 ID 和硬件属性，再将八帧编码结果交给独立软件解码器，检查时间戳、亮度和 UV。build 64 真机运行输出 `Phoenix H.264 VT hardware encode: PASS (8/8)` 和 `Independent software decode and Y/UV check: PASS`，退出码为 0。
+
+开发时可用参考码流验证 VideoToolbox 回调。在本目录运行以下命令。测试替换了 IOKit 后端，保留真实 VideoToolbox 会话。
+
+    clang -std=c11 -O2 -Wall -Wextra -Werror phx_vt_test.c phx_vt.c phx_avc.c \
+        -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+        -framework CoreFoundation -framework IOKit -o /tmp/phx-vt-test
+    /tmp/phx-vt-test vcn_quadrants.h264
+
+## 从原版源码复现
+
+在工作目录中给一份干净的 nullarc 源码应用补丁。补丁内包含 kext、命令行工具、寄存器对照表、测试向量及测试入口。
+
+    BUILD_DIR=$(mktemp -d)
+    PATCH="$PWD/mechrevo-f7bsc-hackintosh/macos/nullarc/patches/phxbringup-vcn.patch"
+    cp -R nullarc-0.4.0-alpha.orig/. "$BUILD_DIR/"
+    (cd "$BUILD_DIR" && git apply --check "$PATCH" && git apply "$PATCH")
+    "$BUILD_DIR/src/phxbringup/build.sh" "$PWD/sdk/MacKernelSDK-master"
+    "$BUILD_DIR/src/phxbringup/tests/vcn_selftest.sh" "$PWD/vcn-ref/vcn_4_0_0.bin"
+    clang -O2 -Wall -Wextra -Werror "$BUILD_DIR/tools/phxctl/vcnctl.c" -framework IOKit -framework CoreFoundation -o "$BUILD_DIR/vcnctl"
+
+    clang -std=c11 -O2 -Wall -Wextra -Werror "$BUILD_DIR/tools/phxctl/vcn_frame_check.c" -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o "$BUILD_DIR/vcn_frame_check"
+    "$BUILD_DIR/vcn_frame_check" "$BUILD_DIR/src/phxbringup/tests/vcn_quadrants.h264"
+
+vcn_quadrants.h264 来自 macOS 软件 AVC 编码器，输入为 160×128、Y=48/200、UV=128 的 NV12 四象限图案，用于独立验证像素检查工具。
 
 ## VCN 诊断
 
@@ -8,20 +56,19 @@
 
     src/phxbringup/tests/vcn_selftest.sh ../vcn-ref/vcn_4_0_0.bin
 
-在工作目录运行安装脚本并重启后执行真机测试。测试先提交四个 END，再提交六个 fence，覆盖统一环回绕，最后调用 SMU 下电。测试脚本设有四分钟的重启 watchdog。测试成功时可以用 --keep 保持引擎上电。
+部署脚本归档在 deploy/。复现部署时，将这三个脚本复制到含 nullarc-0.4.0-alpha 和 vcn-ref 的工作目录，将构建出的 PhxBringup.kext 放在工作目录并命名为 PhxBringup-vcn.kext，再运行 install-vcn.sh。脚本备份现有 kext，记录 ESP 分区 UUID，并安装 vcnctl 和 vcn_frame_check。
 
-    sudo bash install-vcn.sh
-    # 重启并进入 macOS 后执行
+重启进入 macOS 后，在工作目录执行：
+
+    ioreg -r -c PhxBringup -d 1 | grep phx-build
+    # 测试应用接口时确认已加载 64
     sudo bash vcn-test.sh
 
-如果已加载 build 37，但旧版 vcnctl 报 selector 120 的 0xe00002d8 或固件头太短，可单独更新用户态工具，随后直接重跑。这个入口只替换 /Users/Shared/gpu/vcnctl。
-
-    sudo bash install-vcn.sh --tool-only
-    sudo bash vcn-test.sh
+脚本验证固件、四个 END、跨回绕 fence、两种会话，再分别运行 decode-frame 和 encode-frame。解码目标为 864×480 NV12，行跨度 1024，对完整 737280 字节求和应为 0x020345d8。编码目标为 160×128 的单张 IDR 图，独立软件解码器核验四个象限的亮度和中性色度。每次运行在 /Users/Shared/gpu/vcn-run.XXXXXXXX 留存 run.log 和已通过驱动校验的 frame.nv12、frame.h264。失败时另存 crumbs.log。脚本会启动四分钟重启 watchdog，结束时撤销。测试成功可用 --keep 保持 VCN 上电。
 
 如果初始化返回 code 5，可在重启前创建 /Users/Shared/gpu/vcn-fw-at-boot，使经安装脚本修改的 bringup5.sh 在 AUTOLOAD_RLC 前加载 VCN 固件。vcn-test.sh 会读取本次 fwaddr.log 中成功加载后的地址。回退使用 sudo bash rollback-vcn.sh，随后重启。
 
-shell_sim_test.sh 在临时目录中模拟 ESP 和 IOKit，覆盖单独更新 vcnctl、HELLO 握手、固件逐字节暂存、回退、预加载及失败清理。
+shell_sim_test.sh 在临时目录模拟 ESP 和 IOKit，检查 BO 映射、原子文件输出、旧驱动版本、陈旧 fence、阶段错误、坏长度和坏内容，同时验证安装、回退和失败清理。
 
 ## VideoToolbox 验收
 
@@ -33,4 +80,4 @@ shell_sim_test.sh 在临时目录中模拟 ESP 和 IOKit，覆盖单独更新 vc
 
 在有多个 GPU 的机器上用 --gpu-id ID 指定 Phoenix 的 GPU registry ID。软件模式用于对照验收。当前机器的 H.264 和 HEVC 软件往返均通过，四项硬件会话的创建均失败。
 
-端到端硬件编解码仍缺三段实现：PhxBringup 的 MMHUB 映射与 VCN 提交、RADV Darwin 的视频队列与编解码、VideoToolbox 的会话提供方及应用进程可见性。固件 fence 的结果只覆盖命令队列和 writeback。
+默认模式验收系统可发现的编码器和解码器，最终要求 H.264、HEVC 各完成 8 帧硬件编码和解码。进程内 H.264 验收单独使用上文的 `--phx-avc` 模式。

@@ -9,8 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef PHX_VT_ENCODER
+#include "phx_avc.h"
+#include "phx_vt.h"
+#endif
 
-enum { width = 320, height = 192, frameCount = 8, frameRate = 30 };
+enum { frameCount = 8, frameRate = 30 };
+static unsigned width = 320, height = 192;
 static const OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 
 typedef struct {
@@ -37,6 +42,13 @@ static int frameIndex(CMTime pts) {
 static uint8_t luma(int frame, bool right) {
     const bool bright = ((frame & 1) != 0) == right;
     return bright ? 200 : 48;
+}
+
+static uint8_t chroma(int frame, bool bottom, bool cr) {
+    // Luma carries frame bit 0. Cb and Cr carry bits 1 and 2 respectively;
+    // reversing both across the horizontal boundary also checks plane layout.
+    const int mask = cr ? 4 : 2;
+    return (((frame & mask) != 0) ^ bottom ^ cr) ? 176 : 80;
 }
 
 static void encodedFrame(void *ref, void *source, OSStatus status, VTEncodeInfoFlags flags,
@@ -74,11 +86,18 @@ static void decodedFrame(void *ref, void *source, OSStatus status, VTDecodeInfoF
         if (valid) {
             const uint8_t *plane = CVPixelBufferGetBaseAddressOfPlane(image, 0);
             const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
-            valid = plane && stride >= width;
+            const uint8_t *uv = CVPixelBufferGetBaseAddressOfPlane(image, 1);
+            const size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+            valid = plane && uv && stride >= width && uvStride >= width;
             if (valid) {
                 const uint8_t *row = plane + (height / 2) * stride;
                 valid = abs((int)row[width / 4] - luma(index, false)) <= 20 &&
                         abs((int)row[width * 3 / 4] - luma(index, true)) <= 20;
+                for (unsigned half = 0; half < 2; ++half) {
+                    const uint8_t *pair = uv + ((2 * half + 1) * height / 8) * uvStride + width / 2;
+                    valid = valid && abs(pair[0] - chroma(index, half, false)) <= 20 &&
+                                     abs(pair[1] - chroma(index, half, true)) <= 20;
+                }
             }
             CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
         }
@@ -108,7 +127,7 @@ static CFDictionaryRef surfaceAttributes(void) {
     return attrs;
 }
 
-static CFDictionaryRef sessionSpecification(bool encode, bool hardware, CFNumberRef gpu) {
+static CFDictionaryRef sessionSpecification(bool encode, bool hardware, CFNumberRef gpu, CFStringRef encoderID) {
     CFStringRef key, gpuKey;
     if (encode) {
         key = hardware ? kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder
@@ -119,9 +138,12 @@ static CFDictionaryRef sessionSpecification(bool encode, bool hardware, CFNumber
                        : kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder;
         gpuKey = kVTVideoDecoderSpecification_RequiredDecoderGPURegistryID;
     }
-    const void *keys[] = {key, gpuKey};
-    const void *values[] = {hardware ? kCFBooleanTrue : kCFBooleanFalse, gpu};
-    return CFDictionaryCreate(NULL, keys, values, gpu ? 2 : 1, &kCFTypeDictionaryKeyCallBacks,
+    const void *keys[3] = {key};
+    const void *values[3] = {hardware ? kCFBooleanTrue : kCFBooleanFalse};
+    CFIndex count = 1;
+    if (gpu) { keys[count] = gpuKey; values[count++] = gpu; }
+    if (encoderID) { keys[count] = kVTVideoEncoderSpecification_EncoderID; values[count++] = encoderID; }
+    return CFDictionaryCreate(NULL, keys, values, count, &kCFTypeDictionaryKeyCallBacks,
                               &kCFTypeDictionaryValueCallBacks);
 }
 
@@ -169,7 +191,13 @@ static OSStatus encodeFrame(VTCompressionSessionRef session, int index) {
             memset(y + row * yStride, luma(index, false), width / 2);
             memset(y + row * yStride + width / 2, luma(index, true), width / 2);
         }
-        memset(uv, 128, uvStride * (height / 2));
+        for (unsigned row = 0; row < height / 2; ++row) {
+            uint8_t *line = uv + row * uvStride;
+            for (unsigned x = 0; x < width; x += 2) {
+                line[x] = chroma(index, row >= height / 4, false);
+                line[x + 1] = chroma(index, row >= height / 4, true);
+            }
+        }
         CVPixelBufferUnlockBaseAddress(pixel, 0);
         status = VTCompressionSessionEncodeFrame(session, pixel, CMTimeMake(index, frameRate),
                                                   CMTimeMake(1, frameRate), NULL, NULL, NULL);
@@ -178,8 +206,9 @@ static OSStatus encodeFrame(VTCompressionSessionRef session, int index) {
     return status;
 }
 
-static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFDictionaryRef attrs, Encoded *out) {
-    CFDictionaryRef spec = sessionSpecification(true, hardware, gpu);
+static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFStringRef encoderID,
+                   CFDictionaryRef attrs, Encoded *out) {
+    CFDictionaryRef spec = sessionSpecification(true, hardware, gpu, encoderID);
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(NULL, width, height, codec, spec, attrs, NULL,
                                                  encodedFrame, out, &session);
@@ -197,6 +226,12 @@ static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFDic
         status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
     const bool accelerated = status == noErr &&
         checkAcceleration(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, hardware);
+    if (status == noErr && encoderID) {
+        CFTypeRef selected = NULL;
+        status = VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, NULL, &selected);
+        if (!status && (!selected || !CFEqual(selected, encoderID))) status = kVTCouldNotFindVideoEncoderErr;
+        if (selected) CFRelease(selected);
+    }
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
     if (status != noErr)
@@ -214,7 +249,7 @@ static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFDic
 }
 
 static bool decode(const Encoded *encoded, bool hardware, CFNumberRef gpu, CFDictionaryRef attrs) {
-    CFDictionaryRef spec = sessionSpecification(false, hardware, gpu);
+    CFDictionaryRef spec = sessionSpecification(false, hardware, gpu, NULL);
     Decoded out = {.lock = PTHREAD_MUTEX_INITIALIZER};
     VTDecompressionOutputCallbackRecord callback = {decodedFrame, &out};
     VTDecompressionSessionRef session = NULL;
@@ -257,13 +292,13 @@ static bool testCodec(const char *name, CMVideoCodecType codec, bool hardware, C
     Encoded encoded = {.lock = PTHREAD_MUTEX_INITIALIZER};
     printf("%s hardware decode advertised: %s\n", name, VTIsHardwareDecodeSupported(codec) ? "yes" : "no");
     printf("%s %s encode\n", name, hardware ? "hardware" : "software");
-    const bool encodeOK = encode(codec, hardware, gpu, attrs, &encoded);
+    const bool encodeOK = encode(codec, hardware, gpu, NULL, attrs, &encoded);
     printf("  %s (%u/%d compressed frames)\n", encodeOK ? "PASS" : "FAIL", encoded.count, frameCount);
     bool haveInput = encodeOK;
     if (!haveInput && hardware) {
         releaseSamples(&encoded);
         printf("%s software encode for the hardware decoder's input\n", name);
-        haveInput = encode(codec, false, NULL, attrs, &encoded);
+        haveInput = encode(codec, false, NULL, NULL, attrs, &encoded);
     }
     printf("%s %s decode\n", name, hardware ? "hardware" : "software");
     const bool decodeOK = haveInput && decode(&encoded, hardware, gpu, attrs);
@@ -276,6 +311,29 @@ static bool testCodec(const char *name, CMVideoCodecType codec, bool hardware, C
 int main(int argc, char **argv) {
     bool hardware = true;
     CFNumberRef gpu = NULL;
+#ifdef PHX_VT_ENCODER
+    if (argc == 2 && strcmp(argv[1], "--phx-avc") == 0) {
+        OSStatus status = PhxRegisterAVCEncoder();
+        if (status) {
+            fprintf(stderr, "Phoenix encoder registration: %d\n", (int)status);
+            return 1;
+        }
+        width = PhxAVCWidth;
+        height = PhxAVCHeight;
+        CFDictionaryRef attrs = surfaceAttributes();
+        Encoded encoded = {.lock = PTHREAD_MUTEX_INITIALIZER};
+        bool ok = encode(kCMVideoCodecType_H264, true, NULL, PhxAVCEncoderID, attrs, &encoded);
+        printf("Phoenix H.264 VT hardware encode: %s (%u/%d)\n", ok ? "PASS" : "FAIL", encoded.count, frameCount);
+        if (ok) {
+            ok = decode(&encoded, false, NULL, attrs);
+            printf("Independent software decode and Y/UV check: %s\n", ok ? "PASS" : "FAIL");
+        }
+        releaseSamples(&encoded);
+        pthread_mutex_destroy(&encoded.lock);
+        CFRelease(attrs);
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--software") == 0) {
         hardware = false;
     } else if (argc == 3 && strcmp(argv[1], "--gpu-id") == 0) {
