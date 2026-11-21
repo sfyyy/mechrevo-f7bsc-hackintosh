@@ -583,24 +583,27 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 属于驱动整体性能工作，暂不继续；先做 VCN。临时缓解：投屏时少开最大化、带半透明侧栏的窗口。
 关掉统计：从 `nvrm610.conf` 删掉 `NVMTL_WS_GPUTIME=1`（关掉后零开销，重启生效）。
 
-## 没有硬件视频编解码（VCN），共享屏幕和远程桌面全靠 CPU（计划中，必须做）
+## Radeon 780M 的 H.264 / HEVC 硬件编解码仍未接入 VideoToolbox
 
-- 腾讯会议启动时检测到 `no hw h264 encoder ablity` / `no hw hevc encoder ablity`（`video_ability_mac.c`），共享屏幕时用
-  CPU 软件编码 2560×1440 HEVC，CPU 温度 88–91 °C。
-- 向日葵远程控制时 `support hevc 0`：`VTIsHardwareDecodeSupported` 对 H.264 和 HEVC 都返回 0，只能软件解码。
-- 原因：780M 的视频引擎 VCN 4.0 没有驱动。PhxBringup 的命令提交只接受 GFX 和 COMPUTE（`PhxBringup.cpp` 中的
-  `ip_type` 检查），RADV 因此报告不出视频队列（`vkprobe` 看不到 video queue family）。macOS 自带的 AMD 视频驱动
-  不支持 Phoenix。
+- 腾讯会议启动时记录 `no hw h264 encoder ablity` 和 `no hw hevc encoder ablity`，软件编码 2560×1440 HEVC 时 CPU 温度曾达 88–91 °C。向日葵远控日志报告 `support hevc 0`。
+- 当前加载 PhxBringup build 59（VCN 诊断版），安装的 RADV 只报告图形、计算和传输相关队列。VideoToolbox 硬件验收中，H.264 和 HEVC 的编码器均返回 `-12908`，解码器均返回 `-12906`。
 
-计划：
+### PhxBringup build 59：VCN 固件仍未能启动（2026-11-22 暂停）
 
-1. PhxBringup：用 SMU 给 VCN 上电，经 PSP `LOAD_IP_FW` 加载 VCN 4.0 固件，建立 VCN 4 统一队列（ring、doorbell、
-   fence），命令提交放行视频类任务。先用空命令验证队列能执行完。参考 Linux `vcn_v4_0.c` 和 `amdgpu_vcn.c`。
-2. 内核接口：`AMDGPU_INFO_HW_IP_INFO` 报告 VCN 队列，`AMDGPU_INFO_VIDEO_CAPS` 报告编解码能力，补上固件版本查询。
-3. Mesa（RADV）：在 nullarc 的 Mesa 基线上打开 Vulkan Video 的 H.264/HEVC 解码和编码，用独立程序验证。
-4. macOS 接入：在加载插件的进程里调用 VideoToolbox 的 `VTRegisterVideoEncoderWithInfo` 和
-   `VTRegisterVideoDecoderWithInfo`，注册硬件编码器和解码器，输入输出直接用 IOSurface（NV12），让腾讯会议、
-   向日葵等程序检测到并使用硬件编解码。macOS 的硬件解码默认在 `VTDecoderXPCService` 进程里运行，需要单独处理。
+两条启动路径都已试透，`UVD_SCRATCH1` 始终为 0，固件一次都没有真正运行：
+
+- **PSP 间接路径**（Linux 实际使用的路径）：`LOAD_IP_FW(type=49)` 被 PSP 拒绝，返回 `0xFFFF0006`。
+  大小（216–4096）、显存地址（业务块内 8 页 + 固件缓冲区 3 处）、`fw_type`（13/49/50/51）、
+  列表长度（1–27 对）、`POWER_STATUS` 的 PG_MODE 位均逐项排除；我们发出的命令缓冲区从显存导出后，
+  与 Linux 侧 kprobe 抓到的字段完全一致（`bs=0 bv=0 id=6 lo/hi sz=216 ty=49`）。
+  唯一尚未比对的，是那 27 对（偏移,值）的具体顺序与取值。
+- **静态非 DPG 路径**（Linux 在这颗芯片上从不使用）：`--stage 1..7` 全部通过，第 8 步 VCPU 不报告就绪。
+
+途中修掉的真实缺陷：`--fw-type` 原先根本没有传进 kext（应为 `>>16` 而非 `>>24`）；
+`vcnctl toc` 送的是整个 2560 字节文件而非 2304 字节载荷——修正后 PSP **接受 LOAD_TOC（status 0）**。
+
+完整断点、已排除项清单、复现脚本与后续待办见 [VCN NEXT](../macos/nullarc/vcn/NEXT.md)。
+里程碑：固件运行（`SCRATCH1 = 0x09118010`）→ `vcnctl fence` 通过，之后才谈编解码指令流与 VideoToolbox 注册。
 
 ## 没有 HiDPI
 

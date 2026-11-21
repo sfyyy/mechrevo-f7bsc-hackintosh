@@ -1,0 +1,323 @@
+/*
+ * vcnctl — drive the hard-coded VCN 4.0.2 bring-up in PhxBringup.kext (debug selector 120).
+ *
+ *   sudo vcnctl status                 # what the block and the ring currently say
+ *   sudo vcnctl init <vcn_4_0_0.bin>   # stage the firmware, PSP load, SMU power-up, VCPU boot, ring enable
+ *   sudo vcnctl ring [n]               # submit n VCN_ENC_CMD_END packets and watch UVD_RB_RPTR move
+ *   sudo vcnctl down                   # disable the ring and send SMU PowerDownVcn
+ *
+ * Needs phxdebug=1 (already in this machine's boot-args) and root. Selector numbers and result codes are in
+ * src/phxbringup/PhxNativeABI.h (PHXN_SEL_DBG_VCN).
+ */
+#include <IOKit/IOKitLib.h>
+#include <mach/mach_error.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define UC_TYPE 0x4E34384Eu
+#define NATIVE_ABI_VERSION 1u
+#define SEL_HELLO 0u
+#define SEL_VCN 120u
+#define SEL_STAGE 104u
+
+#define PHX_VCN_OK 0u
+#define PHX_VCN_ALREADY 1u
+#define PHX_VCN_NOT_READY 2u
+
+static io_connect_t gConn = 0;
+
+static int openKext(void) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
+    if (!svc) {
+        fprintf(stderr, "PhxBringup not found: is the kext loaded?\n");
+        return 1;
+    }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), UC_TYPE, &gConn);
+    IOObjectRelease(svc);
+    if (kr) {
+        fprintf(stderr, "IOServiceOpen failed: 0x%08x\n", kr);
+        return 1;
+    }
+    const uint64_t in[] = {NATIVE_ABI_VERSION, 0};
+    uint64_t out[4];
+    uint32_t count = 4;
+    kr = IOConnectCallScalarMethod(gConn, SEL_HELLO, in, 2, out, &count);
+    if (kr || count != 4 || out[0] != NATIVE_ABI_VERSION) {
+        if (kr)
+            fprintf(stderr, "PhxBringup HELLO failed: 0x%08x (%s)\n", kr, mach_error_string(kr));
+        else
+            fputs("PhxBringup returned an incompatible HELLO reply\n", stderr);
+        IOServiceClose(gConn);
+        gConn = IO_OBJECT_NULL;
+        return 1;
+    }
+    return 0;
+}
+
+static int vcnOp(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t out[8]) {
+    uint64_t in[5] = {op, a, b, c, d};
+    uint32_t n = 8;
+    const kern_return_t kr = IOConnectCallScalarMethod(gConn, SEL_VCN, in, 5, out, &n);
+    if (kr) {
+        fprintf(stderr, "selector %u op %llu failed: kr 0x%08x (%s)\n", SEL_VCN, (unsigned long long)op,
+                kr, mach_error_string(kr));
+        return 1;
+    }
+    if (n != 8) {
+        fprintf(stderr, "selector %u returned %u scalars, expected 8\n", SEL_VCN, n);
+        return 1;
+    }
+    return 0;
+}
+
+static const char *codeName(uint64_t c) {
+    switch (c) {
+    case 0: return "ok";
+    case 1: return "already up";
+    case 2: return "not ready (VCN down, sleeping, or PSP/TMR not ready)";
+    case 3: return "bad argument";
+    case 4: return "bad firmware header";
+    case 5: return "PSP LOAD_IP_FW failed";
+    case 6: return "PSP returned no usable TMR address";
+    case 7: return "SMU did not acknowledge PowerUpVcn";
+    case 8: return "VCN planes did not power on";
+    case 9: return "VCN registers read all ones";
+    case 10: return "VCPU did not report firmware ready";
+    case 11: return "power-down failed";
+    case 12: return "ring not enabled";
+    case 13: return "UVD_RB_RPTR did not reach the write pointer";
+    case 14: return "firmware did not write the fence";
+    case 15: return "write pointer did not take the value";
+    default: return "unknown";
+    }
+}
+
+static void printOut(const char *tag, const uint64_t o[8]) {
+    printf("%s: code %llu (%s)\n", tag, (unsigned long long)o[0], codeName(o[0]));
+    printf("  detail          0x%llx\n", (unsigned long long)o[1]);
+    printf("  ucode           offset 0x%llx size %llu\n", (unsigned long long)o[2], (unsigned long long)o[3]);
+    printf("  firmware TMR MC 0x%llx\n", (unsigned long long)o[4]);
+    printf("  UVD_STATUS      0x%08x\n", (uint32_t)o[5]);
+    printf("  UVD_PGFSM_STATUS 0x%08x\n", (uint32_t)o[6]);
+    printf("  ring            rptr %u wptr %u\n", (uint32_t)o[7], (uint32_t)(o[7] >> 32));
+}
+
+static int cmdStatus(void) {
+    uint64_t o[8];
+    if (vcnOp(1, 0, 0, 0, 0, o))
+        return 1;
+    printf("VCN: %s\n", o[0] ? "up" : "down");
+    printf("  fw_shared flags 0x%08x  sq 0x%08x (enabled %u, mode %u, status %u)\n", (uint32_t)o[1], (uint32_t)o[2],
+           (unsigned)(o[2] & 1), (unsigned)((o[2] >> 8) & 0xFF), (unsigned)((o[2] >> 16) & 0xFF));
+    printf("  fw TMR MC       0x%llx\n", (unsigned long long)o[4]);
+    printf("  UVD_STATUS      0x%08x\n", (uint32_t)o[5]);
+    printf("  UVD_PGFSM_STATUS 0x%08x\n", (uint32_t)o[6]);
+    printf("  ring            rptr %u wptr %u\n", (uint32_t)o[7], (uint32_t)(o[7] >> 32));
+    return 0;
+}
+
+static int cmdInitRun(uint32_t bufOff, uint32_t len, uint64_t tmrMc);
+
+// The kernel validates the staged header again; doing it here turns a wrong file into a clear message instead of
+// a selector result. Mirrors phx_vcn::fwHeaderOk.
+static int checkFwHeader(FILE *f, long len, uint32_t *ucodeOff, uint32_t *ucodeSize) {
+    uint32_t h[8];
+    if (len < (long)sizeof(h)) {
+        fputs("file is shorter than a 32-byte firmware header\n", stderr);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        perror("seek to firmware header");
+        return 1;
+    }
+    if (fread(h, 1, sizeof(h), f) != sizeof(h)) {
+        if (ferror(f))
+            perror("read firmware header");
+        else
+            fputs("unexpected EOF while reading firmware header\n", stderr);
+        return 1;
+    }
+    const uint32_t sizeBytes = h[0], headerBytes = h[1];
+    const uint16_t hdrMajor = (uint16_t)h[2], hdrMinor = (uint16_t)(h[2] >> 16);
+    const uint16_t ipMajor = (uint16_t)h[3], ipMinor = (uint16_t)(h[3] >> 16);
+    const uint32_t usize = h[5], off = h[6];
+    if (headerBytes != 32 || hdrMajor != 1 || hdrMinor != 0 || ipMajor != 4 || ipMinor != 0) {
+        fprintf(stderr, "not a VCN 4.0 image: header %u.%u size %u, IP %u.%u\n", hdrMajor, hdrMinor, headerBytes,
+                ipMajor, ipMinor);
+        return 1;
+    }
+    if (off < headerBytes || (off & 3u) || usize == 0 || (uint64_t)off + usize > (uint64_t)len || sizeBytes != len) {
+        fprintf(stderr, "bad layout: size_bytes %u, ucode off %u size %u, file %ld\n", sizeBytes, off, usize, len);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        perror("seek to firmware start for staging");
+        return 1;
+    }
+    *ucodeOff = off;
+    *ucodeSize = usize;
+    return 0;
+}
+
+static int cmdInit(const char *path, uint32_t bufOff, uint64_t tmrMc, int checkOnly) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror(path);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("seek");
+        fclose(f);
+        return 1;
+    }
+    const long len = ftell(f);
+    if (len <= 0 || len > (16 << 20)) {
+        fprintf(stderr, "%s: implausible size %ld\n", path, len);
+        fclose(f);
+        return 1;
+    }
+    uint32_t ucodeOff = 0, ucodeSize = 0;
+    if (checkFwHeader(f, len, &ucodeOff, &ucodeSize)) {
+        fclose(f);
+        return 1;
+    }
+    printf("%s: VCN 4.0 firmware, ucode at 0x%x, %u bytes\n", path, ucodeOff, ucodeSize);
+    if (checkOnly) {
+        fclose(f);
+        return 0;
+    }
+    uint8_t chunk[4096];
+    uint32_t staged = 0;
+    while (staged < (uint32_t)len) {
+        const size_t want = (uint32_t)len - staged > sizeof(chunk) ? sizeof(chunk) : (uint32_t)len - staged;
+        const size_t got = fread(chunk, 1, want, f);
+        if (got != want) {
+            fprintf(stderr, "%s: short read at 0x%x\n", path, staged);
+            fclose(f);
+            return 1;
+        }
+        uint64_t in[1] = {bufOff + staged};
+        const kern_return_t kr = IOConnectCallMethod(gConn, SEL_STAGE, in, 1, chunk, got, NULL, NULL, NULL, NULL);
+        if (kr) {
+            fprintf(stderr, "stage at 0x%x failed: kr 0x%08x (is the PSP ring up? see phxboot)\n", bufOff + staged, kr);
+            fclose(f);
+            return 1;
+        }
+        staged += (uint32_t)got;
+    }
+    fclose(f);
+    printf("staged %s: %u bytes at fw_buf+0x%x\n", path, staged, bufOff);
+    return cmdInitRun(bufOff, staged, tmrMc);
+}
+
+static int cmdInitRun(uint32_t bufOff, uint32_t len, uint64_t tmrMc) {
+    uint64_t o[8];
+    if (vcnOp(2, bufOff, len, tmrMc & 0xFFFFFFFFull, tmrMc >> 32, o))
+        return 1;
+    printOut("init", o);
+    return o[0] == PHX_VCN_OK || o[0] == PHX_VCN_ALREADY ? 0 : 1;
+}
+
+static int cmdRing(int count) {
+    for (int i = 0; i < count; i++) {
+        uint64_t o[8];
+        if (vcnOp(3, 0, 0, 0, 0, o))
+            return 1;
+        printf("ring %d: code %llu (%s) rptr %llu -> %llu wptr %llu queue_status %llu UVD_STATUS 0x%08x\n", i + 1,
+               (unsigned long long)o[0], codeName(o[0]), (unsigned long long)o[1], (unsigned long long)o[2],
+               (unsigned long long)o[3], (unsigned long long)o[4], (uint32_t)o[5]);
+        if (o[0] != PHX_VCN_OK)
+            return 1;
+    }
+    return 0;
+}
+
+static int cmdFence(int count) {
+    for (int i = 0; i < count; i++) {
+        uint64_t o[8];
+        if (vcnOp(5, 0, 0, 0, 0, o))
+            return 1;
+        printf("fence %d: code %llu (%s) seq %llu seen 0x%08x rptr %llu -> %llu UVD_STATUS 0x%08x\n", i + 1,
+               (unsigned long long)o[0], codeName(o[0]), (unsigned long long)o[1],
+               (uint32_t)o[2], (unsigned long long)o[4], (unsigned long long)o[5], (uint32_t)o[6]);
+        if (o[0] != PHX_VCN_OK)
+            return 1;
+    }
+    return 0;
+}
+
+static int cmdDown(void) {
+    uint64_t o[8];
+    if (vcnOp(4, 0, 0, 0, 0, o))
+        return 1;
+    if (o[0] == PHX_VCN_NOT_READY) {
+        puts("VCN already down or sleeping");
+        return 0;
+    }
+    printf("down: code %llu (%s), SMU response 0x%08x\n", (unsigned long long)o[0], codeName(o[0]), (uint32_t)o[1]);
+    return o[0] != PHX_VCN_OK;
+}
+
+static uint64_t positiveNumber(const char *arg, int base) {
+    char *end = NULL;
+    errno = 0;
+    const uint64_t value = strtoull(arg, &end, base);
+    return errno || arg == end || *end || *arg < '0' || *arg > '9' ? 0 : value;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "check-firmware"))
+        return cmdInit(argv[2], 0, 0, 1);
+    if (argc < 2) {
+        fprintf(stderr,
+                "       vcnctl check-firmware <vcn_4_0_0.bin>\n"
+                "usage: sudo vcnctl status | init [--tmr <mc>] <vcn_4_0_0.bin> | ring [n] | fence [n] | down\n"
+                "  init stages the firmware in the kext's fw_buf, loads it through the PSP, powers VCN up with\n"
+                "  the SMU and boots the VCPU. --tmr skips the PSP load and uses a TMR address the boot script\n"
+                "  already loaded (see /Users/Shared/gpu/fwaddr.log). ring submits VCN_ENC_CMD_END and checks\n"
+                "  that the firmware moves the read pointer; fence submits a real VCN_ENC_CMD_FENCE packet and\n"
+                "  waits for the firmware to write that value into the ring's WB slot. Nothing runs at boot.\n");
+        return 2;
+    }
+    if (geteuid() != 0) {
+        fprintf(stderr, "run as root (the VCN selectors are root-only)\n");
+        return 1;
+    }
+    if (openKext())
+        return 1;
+
+    int rc;
+    if (!strcmp(argv[1], "status")) {
+        rc = cmdStatus();
+    } else if (!strcmp(argv[1], "init")) {
+        const char *path = NULL;
+        uint64_t tmr = 0;
+        if (argc == 3 && strcmp(argv[2], "--tmr")) {
+            path = argv[2];
+        } else if (argc == 5 && !strcmp(argv[2], "--tmr")) {
+            tmr = positiveNumber(argv[3], 0);
+            if (tmr)
+                path = argv[4];
+        }
+        rc = path ? cmdInit(path, 0, tmr, 0) : (fprintf(stderr, "usage: vcnctl init [--tmr <mc>] <firmware>\n"), 2);
+    } else if (!strcmp(argv[1], "ring") || !strcmp(argv[1], "fence")) {
+        const uint64_t count = argc == 2 ? 1 : positiveNumber(argv[2], 10);
+        if (argc > 3 || count == 0 || count > INT32_MAX) {
+            fprintf(stderr, "%s needs a positive packet count\n", argv[1]);
+            rc = 2;
+        } else {
+            rc = !strcmp(argv[1], "ring") ? cmdRing((int)count) : cmdFence((int)count);
+        }
+    } else if (!strcmp(argv[1], "down")) {
+        rc = cmdDown();
+    } else {
+        fprintf(stderr, "unknown command %s\n", argv[1]);
+        rc = 2;
+    }
+    IOServiceClose(gConn);
+    return rc;
+}

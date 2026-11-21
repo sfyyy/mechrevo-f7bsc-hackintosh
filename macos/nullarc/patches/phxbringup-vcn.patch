@@ -1,0 +1,961 @@
+# PhxBringup build 37: reviewed VCN 4.0.2 diagnostic bring-up (Phoenix 780M).
+# Applies to pristine nullarc 0.4.0-alpha. Includes build 35's page-table limit fix.
+# Selector 120 is root/debug-only. The patch does not add a VideoToolbox provider.
+#
+--- a/src/phxbringup/PhxBringup.cpp
++++ b/src/phxbringup/PhxBringup.cpp
+@@ -23,9 +23,12 @@
+ #include <kern/clock.h>
+ 
+ #include "PhxNativeABI.h"
++#include "PhxVcn.h"
+ 
+-#define PHX_KEXT_BUILD 34u
++using namespace phx_vcn;   // hard-coded VCN 4.0.2 constants (PhxVcn.h); the k* names below are all VCN's
+ 
++#define PHX_KEXT_BUILD 37u
++
+ // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
+ // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
+ // memory snooped, kPteSysFlags). With clflush, WindowServer spent ~73% of its CPU here and composited ~13 fps; with
+@@ -68,9 +71,12 @@
+ // Pools reported to RADV. E1 backs every BO with system memory, so these are budgets, not hardware:
+ // BAR0 is 256 MiB on this machine, the UMA carve-out 6 GiB.
+ static constexpr uint64_t kVisTotal = 256ull << 20;
+-static constexpr uint64_t kHiTotal = 1536ull << 20;
+-static constexpr uint64_t kGttCap = 512ull << 20;
+-static constexpr uint64_t kGttMaxBo = 256ull << 20;
++// F7BSC (build 35): every pool is wired system RAM on this APU (32 GiB), so the 1536/512 MiB budgets only made
++// WindowServer fail allocations (SkyLight then aborts -> back to the login window). Raised; RADV sizes its heaps from
++// vis + GTT, so the plugin also sees a 1.5 GiB "card" instead of 512 MiB and stops evicting/spilling as early.
++static constexpr uint64_t kHiTotal = 3840ull << 20;
++static constexpr uint64_t kGttCap = 2048ull << 20;
++static constexpr uint64_t kGttMaxBo = 1024ull << 20;
+ static constexpr uint64_t kHostCap = 4096ull << 20, kHostMaxBo = 1024ull << 20;   // host imports, per client
+ static constexpr uint64_t kVaMask = (1ull << 48) - 1;
+ static constexpr int kMaxMaps = 4096;
+@@ -117,6 +123,14 @@
+     uint64_t gpuRetired() const;
+     const phx_topology *capturedTopology() const { return topology; }
+     IOReturn setPowerState(unsigned long ordinal, IOService *whichDevice) override;
++    // VCN 4.0.2 bring-up (hard-coded for Phoenix). Reached only through debug selector 120, never at boot: the
++    // PSP firmware load, the SMU power-up, the register sequence and the ring test all happen on demand, and a
++    // failure powers the block down again. out[] layout is documented in PhxNativeABI.h (PHXN_SEL_DBG_VCN).
++    IOReturn vcnStatus(uint64_t out[8]);
++    IOReturn vcnInit(uint32_t fwOff, uint32_t fwLen, uint64_t tmrMc, uint64_t out[8]);
++    IOReturn vcnRingTest(uint64_t out[8]);
++    IOReturn vcnFenceTest(uint64_t out[8]);
++    IOReturn vcnShutdown(uint64_t out[8]);
+ 
+ private:
+     uint32_t rreg(uint32_t reg) const;
+@@ -178,7 +192,7 @@
+     // A context's page tables, in physically contiguous 64 KiB chunks allocated as it maps (most contexts need one or
+     // two): a single 4 MiB contiguous pool per context failed once memory was fragmented. Table i is page i % 16 of
+     // chunk i / 16; table 0 is the root.
+-    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 64;
++    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 256;   // 4096 tables = 8 GiB mapped per process (64 capped it at ~2 GiB)
+     struct VmCtx {
+         IOBufferMemoryDescriptor *chunk[kPtChunks];
+         uint64_t chunkPhys[kPtChunks];
+@@ -210,6 +224,27 @@
+     bool debug{false};
+     bool smuUsed{false};
+     volatile SInt32 sessionOpen{0};
++
++    // --- VCN (hard-coded Phoenix VCN 4.0.2) -------------------------------------------------------------------
++    IOLock *vcnLock{nullptr};
++    bool vcnReady{false};
++    bool vcnNeedsPowerDown{false};
++    uint64_t vcnFwMc{0};          // TMR MC address the PSP placed the firmware at (LOAD_IP_FW response)
++    uint32_t vcnRingWptr{0};      // next dword slot in the unified ring
++    uint32_t vcnFenceSeq{0};      // last fence value submitted through vcnFenceTest
++    uint32_t vcnPowerUp(uint32_t ucodeSize, uint64_t out[8]);   // SMU power-up + registers (vcnLock held)
++    bool vcnPowerDown(uint32_t *response);
++    uint32_t vcnLoadFirmware(uint32_t fwOff, uint32_t fwLen, uint64_t preloadMc, uint64_t out[8]);
++    uint32_t vcnSubmitTest(const uint32_t *packet, uint32_t count, uint32_t seq,
++                          uint32_t *before, uint32_t *after, uint32_t *observed);
++    void vcnRecord(uint64_t out[8]) const;
++    bool vcnRegOk(uint32_t reg) const;
++    bool vcnWaitReg(uint32_t reg, uint32_t mask, uint32_t value, uint32_t timeoutMs) const;
++    uint64_t vcnMc(uint32_t off) const { return fbMcBase + off; }
++    uint32_t vcnReadVram(uint32_t off) const;
++    void vcnWriteVram(uint32_t off, uint32_t value);
++    void vcnZeroVram(uint32_t off, uint32_t bytes);
++    void vcnSharedQueueMode(uint32_t set, uint32_t clear);
+ };
+ 
+ OSDefineMetaClassAndStructors(PhxBringup, IOService)
+@@ -268,6 +303,7 @@
+     IOReturn doDbgSysMem(IOExternalMethodArguments *a);
+     IOReturn doDbgAdoptQueue(IOExternalMethodArguments *a);
+     IOReturn doDbgClaim(IOExternalMethodArguments *a);
++    IOReturn doDbgVcn(IOExternalMethodArguments *a);
+     void flushBos();
+     Bo *findBo(uint32_t h);
+     bool ibCovered(uint64_t vaCanon, uint64_t bytes);
+@@ -342,6 +378,7 @@
+     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+     smuLock = IOLockAlloc();
+     gpuLock = IOLockAlloc();
++    vcnLock = IOLockAlloc();
+     uint32_t dbg = 0;
+     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
+     if (mmio) {
+@@ -383,6 +420,13 @@
+         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
+         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+         gSysctlUp = 0;
++    }
++    if (vcnLock) {
++        IOLockLock(vcnLock);
++        uint32_t response = 0;
++        if (vcnNeedsPowerDown && !isSleeping)
++            vcnPowerDown(&response);
++        IOLockUnlock(vcnLock);
+     }
+     clearRing();
+     if (fbAper) {
+@@ -406,6 +450,10 @@
+         IOLockFree(gpuLock);
+         gpuLock = nullptr;
+     }
++    if (vcnLock) {
++        IOLockFree(vcnLock);
++        vcnLock = nullptr;
++    }
+     if (doorbellMap) {
+         doorbellMap->release();
+         doorbellMap = nullptr;
+@@ -427,13 +475,21 @@
+ }
+ 
+ IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice) {
++    if (vcnLock)
++        IOLockLock(vcnLock);
+     if (ordinal == 0) {
+         IOLog("PhxBringup: powerStateWillChange to sleep (state 0)\n");
++        uint32_t response = 0;
++        if (vcnNeedsPowerDown && !isSleeping)
++            vcnPowerDown(&response);
++        vcnFwMc = 0;
+         isSleeping = true;
+     } else {
+         IOLog("PhxBringup: powerStateDidChange from sleep (state 1)\n");
+         isSleeping = false;
+     }
++    if (vcnLock)
++        IOLockUnlock(vcnLock);
+     return IOPMAckImplied;
+ }
+ 
+@@ -790,6 +846,10 @@
+         uint64_t *pte = pa ? vmPte(c, va + p, true) : nullptr;
+         if (!pte) {
+             r = pa ? kIOReturnNoMemory : kIOReturnVMError;
++            static uint32_t ptSaid;
++            if (pa && (ptSaid++ < 8 || (ptSaid & 1023) == 0))
++                IOLog("PhxBringup: GPU page tables of context %u full (%u of %u table pages) - a %llu-byte map refused\n",
++                      handle, c.used, c.pages, (unsigned long long)size);
+             break;
+         }
+         *pte = (pa & kPtAddrMask) | kPteSysFlags;
+@@ -1226,16 +1286,20 @@
+         uint32_t size = arg ? arg : 0x400000u;
+         if (size > PHX_VRAM_TMR_CAP)
+             size = PHX_VRAM_TMR_CAP;
+-        tmrSize = size;
+         // psp_gfx_cmd_setup_tmr (Linux psp_prep_tmr_cmd_buf): buf_phy_addr = TMR MC address, buf_size,
+         // bitfield(virt_phy_addr=1 => 0x2), system_phy_addr = the REAL system-physical address of the TMR
+         // (amdgpu_gmc_vram_pa = mc - vram_start + vram_base_offset = fbPhys + tmrOff on this UMA part).
+-        uint64_t tmrPa = fbPhys + tmrOff;
+-        uint32_t u[6] = {static_cast<uint32_t>(tmrMc), static_cast<uint32_t>(tmrMc >> 32), size, 0x2u,
++        const uint64_t mc = fbMcBase + PHX_VRAM_TMR_OFF;
++        const uint64_t tmrPa = fbPhys + PHX_VRAM_TMR_OFF;
++        uint32_t u[6] = {static_cast<uint32_t>(mc), static_cast<uint32_t>(mc >> 32), size, 0x2u,
+                          static_cast<uint32_t>(tmrPa), static_cast<uint32_t>(tmrPa >> 32)};
+         r = pspRunCmd(PHX_PSP_GFX_CMD_SETUP_TMR, u, 6, out);
+-        if (r == kIOReturnSuccess)
++        if (r == kIOReturnSuccess && out[0] == 0) {
++            tmrOff = PHX_VRAM_TMR_OFF;
++            tmrMc = mc;
++            tmrSize = size;
+             tmrSetUp = true;
++        }
+     } else if (op == 2) {
+         r = pspRunCmd(PHX_PSP_GFX_CMD_AUTOLOAD_RLC, nullptr, 0, out);
+     } else {
+@@ -1252,6 +1316,14 @@
+         return kIOReturnNotReady;
+     IOLockLock(smuLock);
+     IOReturn r = ringMc ? pspRunCmd(cmdId, words, 6, out) : kIOReturnNotReady;
++    if (cmdId == PHX_PSP_GFX_CMD_SETUP_TMR && r == kIOReturnSuccess && out[0] == 0) {
++        // bringup5.sh uses the raw PSP setup command. Record its successful MC window for VCN cache validation.
++        tmrMc = (static_cast<uint64_t>(words[1]) << 32) | words[0];
++        tmrSize = words[2];
++        tmrSetUp = (words[3] & 0x2u) && tmrMc >= fbMcBase && tmrSize <= fbSize &&
++                   tmrMc - fbMcBase <= fbSize - tmrSize;
++        tmrOff = tmrSetUp ? tmrMc - fbMcBase : 0;
++    }
+     IOLockUnlock(smuLock);
+     return r;
+ }
+@@ -1286,8 +1358,412 @@
+     *argAfter = rreg(PHX_SMU_ARG_REG);
+     IOLockUnlock(smuLock);
+     return r ? kIOReturnSuccess : kIOReturnTimeout;
++}
++
++// --- VCN 4.0.2 (hard-coded Phoenix) ---------------------------------------------------------------------------
++//
++// Linux's vcn_v4_0.c recipe, with every address and value fixed in PhxVcn.h: PSP LOAD_IP_FW stages the firmware
++// in the TMR, SMU PowerUpVcn un-gates the block, the VCPU is pointed at the firmware (cache window 0), the stack
++// and context windows and fw_shared, then the unified ring is enabled. The ring test writes VCN_ENC_CMD_END and
++// waits for UVD_RB_RPTR to move, which is what amdgpu_vcn_enc_ring_test_ring does on this hardware.
++//
++// Selector 120 (root + phxdebug=1) starts the diagnostic engine. Sleep and driver teardown stop it if active.
++
++bool PhxBringup::vcnRegOk(uint32_t reg) const {
++    return mmio && (static_cast<uint64_t>(reg) + 1u) * 4u <= mmio->getLength();
++}
++
++bool PhxBringup::vcnWaitReg(uint32_t reg, uint32_t mask, uint32_t value, uint32_t timeoutMs) const {
++    for (uint32_t i = 0; i < timeoutMs; i++) {
++        const uint32_t observed = rreg(reg);
++        if (observed != UINT32_MAX && (observed & mask) == value)
++            return true;
++        IOSleep(1);
++    }
++    return false;
++}
++
++uint32_t PhxBringup::vcnReadVram(uint32_t off) const {
++    if (!fbAper || (off & 3u) || static_cast<uint64_t>(off) + 4u > fbAperLen)
++        return 0xFFFFFFFFu;
++    return *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(fbAper->getVirtualAddress()) + off);
++}
++
++void PhxBringup::vcnWriteVram(uint32_t off, uint32_t value) {
++    if (!fbAper || (off & 3u) || static_cast<uint64_t>(off) + 4u > fbAperLen)
++        return;
++    *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<volatile uint8_t *>(fbAper->getVirtualAddress()) + off) = value;
++}
++
++void PhxBringup::vcnZeroVram(uint32_t off, uint32_t bytes) {
++    for (uint32_t i = 0; i + 4u <= bytes; i += 4u)
++        vcnWriteVram(off + i, 0);
++}
++
++void PhxBringup::vcnSharedQueueMode(uint32_t set, uint32_t clear) {
++    // An independent byte write avoids overwriting a concurrent firmware queue_status update.
++    auto *mode = reinterpret_cast<volatile uint8_t *>(fbAper->getVirtualAddress()) +
++                 kBoOffset + kSharedOff + kSharedSq + 1u;
++    *mode = static_cast<uint8_t>((*mode & ~clear) | set);
++    __asm__ __volatile__("sfence" ::: "memory");
++    hdpFlush();
++}
++
++void PhxBringup::vcnRecord(uint64_t out[8]) const {
++    if (isSleeping)
++        return;
++    out[5] = vcnRegOk(kRegUvdStatus) ? rreg(kRegUvdStatus) : 0;
++    out[6] = vcnRegOk(kRegPgfsmStatus) ? rreg(kRegPgfsmStatus) : 0;
++    out[7] = vcnRegOk(kRegRbRptr) ? rreg(kRegRbRptr) : 0;
++}
++
++bool PhxBringup::vcnPowerDown(uint32_t *response) {
++    if (vcnRegOk(kRegRbEnable)) {
++        const uint32_t enabled = rreg(kRegRbEnable);
++        if (enabled != UINT32_MAX) {
++            wreg(kRegRbEnable, enabled & ~kRbEnableRb1);
++            (void)rreg(kRegRbEnable);
++        }
++    }
++    uint32_t after = 0;
++    const IOReturn r = smuMessage(kPpsmcPowerDownVcn, 0, response, &after);
++    vcnReady = false;
++    vcnRingWptr = 0;
++    vcnFwMc = 0;
++    vcnNeedsPowerDown = r != kIOReturnSuccess || *response != kPpsmcResultOk;
++    if (vcnNeedsPowerDown)
++        IOLog("PhxBringup: VCN PowerDownVcn failed (kr 0x%08x, response 0x%08x)\n", r, *response);
++    return !vcnNeedsPowerDown;
++}
++
++IOReturn PhxBringup::vcnStatus(uint64_t out[8]) {
++    bzero(out, sizeof(uint64_t) * 8u);
++    if (!mmio || !fbAper || !vcnLock)
++        return kIOReturnNotReady;
++    IOLockLock(vcnLock);
++    out[0] = vcnReady;
++    out[4] = vcnFwMc;
++    if (vcnReady) {
++        out[1] = vcnReadVram(kBoOffset + kSharedOff + kSharedPresentFlags);
++        out[2] = vcnReadVram(kBoOffset + kSharedOff + kSharedSq);      // sq: enabled | mode << 8 | status << 16
++    }
++    vcnRecord(out);
++    out[7] |= static_cast<uint64_t>(vcnRingWptr) << 32;
++    IOLockUnlock(vcnLock);
++    return kIOReturnSuccess;
++}
++
++// SMU power-up, register programming and VCPU boot. Runs with vcnLock held.
++uint32_t PhxBringup::vcnPowerUp(uint32_t ucodeSize, uint64_t out[8]) {
++    uint32_t resp = 0, after = 0;
++    IOReturn r = smuMessage(kPpsmcPowerUpVcn, 0, &resp, &after);
++    out[1] = resp;
++    if (r != kIOReturnSuccess || resp != kPpsmcResultOk)
++        return PHX_VCN_SMU;
++    vcnNeedsPowerDown = true;
++
++    uint32_t code = PHX_VCN_OK;
++    do {
++        // 1. power planes on. Linux has two encodings: "1" when VCN static power gating is not used (the APU
++        // case; expect 0x2A2A8AA0 back) and "2" when it is (expect all planes on, i.e. 0).
++        wreg(kRegPgfsmConfig, kPgfsmConfigNoPg);
++        if (!vcnWaitReg(kRegPgfsmStatus, kPgfsmStatusMask, kPgfsmPoweredNoPg, 400)) {
++            wreg(kRegPgfsmConfig, kPgfsmConfigPg);
++            if (!vcnWaitReg(kRegPgfsmStatus, kPgfsmStatusMask, kPgfsmPoweredPg, 400)) {
++                code = PHX_VCN_NO_POWER;
++                break;
++            }
++        }
++        // An absent block reads all-ones. All-zeros is normal for a powered but not yet booted VCPU, so
++        // PGFSM_STATUS above (not UVD_STATUS) is what decides that the block is alive.
++        if (rreg(kRegUvdStatus) == 0xFFFFFFFFu) {
++            code = PHX_VCN_NO_BLOCK;
++            break;
++        }
++        wreg(kRegPowerStatus, rreg(kRegPowerStatus) & kPowerStatusKeep);
++
++        // 2. the non-DPG start sequence of vcn_v4_0_start (clock gating is left to the SMU: this block runs
++        //    VCN_MGCG, where Linux returns before touching the CGC registers).
++        wreg(kRegRbEnable, rreg(kRegRbEnable) & ~kRbEnableRb1);
++        wreg(kRegVcpuCntl, rreg(kRegVcpuCntl) | kVcpuCntlClkEn | kVcpuCntlBlkRst);
++        wreg(kRegUvdStatus, kUvdStatusBusy);
++        wreg(kRegMastintEn, rreg(kRegMastintEn) & ~kMastintEnVcpuEn);
++        wreg(kRegLmiCtrl2, rreg(kRegLmiCtrl2) & ~kLmiCtrl2StallUmc);
++        wreg(kRegSoftReset, rreg(kRegSoftReset) & ~(kSoftResetLmi | kSoftResetLmiUmc));
++        wreg(kRegLmiCtrl, rreg(kRegLmiCtrl) | kLmiCtrlFlags);
++        wreg(kRegMpcCntl, (rreg(kRegMpcCntl) & ~kMpcCntlReplMask) | (kMpcCntlReplMode << kMpcCntlReplShift));
++        wreg(kRegMpcSetMuxA0, kMpcSetMuxA);
++        wreg(kRegMpcSetMuxB0, kMpcSetMuxB);
++        wreg(kRegMpcSetMux, kMpcSetMux);
++
++        // 3. the per-instance VRAM block: stack, context, fw_shared and ring. Zero it, then write the fw_shared
++        //    handshake fields exactly as vcn_v4_0_fw_shared_init does (v4.0.2 also wants the DRM-key workaround).
++        vcnZeroVram(kBoOffset, kBoSize);
++        const uint32_t flags = kFwFlagUnifiedQueue | kFwFlagSmuDpm | kFwFlagDrmKeyInject;
++        vcnWriteVram(kBoOffset + kSharedOff + kSharedPresentFlags, flags);
++        vcnWriteVram(kBoOffset + kSharedOff + kSharedSq, kSharedSqEnabled);
++        vcnWriteVram(kBoOffset + kSharedOff + kSharedSmuInterface, kFwSmuInterfaceApu);
++        vcnWriteVram(kBoOffset + kSharedOff + kSharedDrmKey, kFwDrmKeyMethod);
++        // The physical function leaves SR-IOV ring metadata zeroed.
++        __asm__ __volatile__("sfence" ::: "memory");
++        hdpFlush();
++
++        // 4. VCPU cache windows: 0 = firmware in the TMR, 1 = stack, 2 = context, NC0 = fw_shared.
++        const uint32_t cache0 = firmwareCacheBytes(ucodeSize);
++        const uint64_t stackMc = vcnMc(kBoOffset + kStackOff);
++        const uint64_t ctxMc = vcnMc(kBoOffset + kCtxOff);
++        const uint64_t sharedMc = vcnMc(kBoOffset + kSharedOff);
++        wreg(kRegLmiVcpuCacheBarLo, static_cast<uint32_t>(vcnFwMc));
++        wreg(kRegLmiVcpuCacheBarHi, static_cast<uint32_t>(vcnFwMc >> 32));
++        wreg(kRegVcpuCacheOffset0, 0);
++        wreg(kRegVcpuCacheSize0, cache0);
++        wreg(kRegLmiVcpuCache1BarLo, static_cast<uint32_t>(stackMc));
++        wreg(kRegLmiVcpuCache1BarHi, static_cast<uint32_t>(stackMc >> 32));
++        wreg(kRegVcpuCacheOffset1, 0);
++        wreg(kRegVcpuCacheSize1, kStackSize);
++        wreg(kRegLmiVcpuCache2BarLo, static_cast<uint32_t>(ctxMc));
++        wreg(kRegLmiVcpuCache2BarHi, static_cast<uint32_t>(ctxMc >> 32));
++        wreg(kRegVcpuCacheOffset2, 0);
++        wreg(kRegVcpuCacheSize2, kCtxSize);
++        wreg(kRegLmiVcpuNc0BarLo, static_cast<uint32_t>(sharedMc));
++        wreg(kRegLmiVcpuNc0BarHi, static_cast<uint32_t>(sharedMc >> 32));
++        wreg(kRegVcpuNoncacheOffset0, 0);
++        wreg(kRegVcpuNoncacheSize0, kSharedSize);
++        wreg(kRegGfx10AddrConfig, kGbAddrConfig);   // GB_ADDR_CONFIG of this APU
++
++        // 5. let the VCPU run and wait for its firmware-ready report (UVD_STATUS bit 1).
++        wreg(kRegRbArbCtrl, rreg(kRegRbArbCtrl) & ~kRbArbCtrlVcpuDis);
++        wreg(kRegVcpuCntl, rreg(kRegVcpuCntl) & ~kVcpuCntlBlkRst);
++        if (!vcnWaitReg(kRegUvdStatus, kUvdStatusVcpuRdy, kUvdStatusVcpuRdy, 5000)) {
++            code = PHX_VCN_NO_VCPU;
++            break;
++        }
++        wreg(kRegUvdStatus, rreg(kRegUvdStatus) & ~kUvdStatusBusy);
++
++        // 6. unified ring. No doorbell: DB_CTRL stays disabled and the write pointer goes to UVD_RB_WPTR, so
++        //    this cannot collide with the MES/Metal doorbells the boot script already owns.
++        const uint64_t ringMc64 = vcnMc(kBoOffset + kRingOff);
++        wreg(kRegRb1DbCtrl, 0);
++        wreg(kRegRbBaseLo, static_cast<uint32_t>(ringMc64));
++        wreg(kRegRbBaseHi, static_cast<uint32_t>(ringMc64 >> 32));
++        wreg(kRegRbSize, kRingDw);
++        wreg(kRegRbEnable, rreg(kRegRbEnable) & ~kRbEnableRb1);
++        vcnSharedQueueMode(kFwQueueRingReset, 0);
++        wreg(kRegRbRptr, 0);
++        wreg(kRegRbWptr, 0);
++        vcnRingWptr = rreg(kRegRbRptr);
++        if (vcnRingWptr != 0 || rreg(kRegRbWptr) != 0) {
++            code = PHX_VCN_WPTR_REJECTED;
++            break;
++        }
++        wreg(kRegRbEnable, rreg(kRegRbEnable) | kRbEnableRb1);
++        vcnSharedQueueMode(0, kFwQueueRingReset | kFwQueueDpgHoldOff);
++        (void)rreg(kRegUvdStatus);   // read-back barrier, as Linux does before the ring is used
++        const uint32_t enabled = rreg(kRegRbEnable);
++        if (enabled == UINT32_MAX || !(enabled & kRbEnableRb1)) {
++            code = PHX_VCN_RING_NOT_ENABLED;
++            break;
++        }
++    } while (false);
++
++    vcnRecord(out);
++    if (code != PHX_VCN_OK) {
++        uint32_t response = 0;
++        vcnPowerDown(&response);
++    } else {
++        vcnReady = true;
++    }
++    return code;
+ }
+ 
++// Caller holds smuLock so the TMR and fw_buf cannot change during validation or PSP submission.
++uint32_t PhxBringup::vcnLoadFirmware(uint32_t fwOff, uint32_t fwLen, uint64_t preloadMc, uint64_t out[8]) {
++    if (!ringMc || !fwBufSize || !tmrSetUp)
++        return PHX_VCN_NOT_READY;
++    if ((fwOff & 3u) || fwLen < sizeof(FwHeader) || static_cast<uint64_t>(fwOff) + fwLen > fwBufSize ||
++        (tmrOff < kBoOffset + kBoSize && tmrOff + tmrSize > kBoOffset))
++        return PHX_VCN_BAD_ARG;
++
++    uint32_t words[sizeof(FwHeader) / sizeof(uint32_t)];
++    for (uint32_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
++        words[i] = vcnReadVram(static_cast<uint32_t>(fwBufOff + fwOff + i * sizeof(uint32_t)));
++    FwHeader h;
++    memcpy(&h, words, sizeof(h));
++    uint32_t ucodeOff = 0, ucodeSize = 0;
++    if (!fwHeaderOk(h, fwLen, &ucodeOff, &ucodeSize))
++        return PHX_VCN_BAD_FW;
++    out[2] = ucodeOff;
++    out[3] = ucodeSize;
++
++    uint64_t fwMc = preloadMc;
++    if (!fwMc) {
++        const uint64_t src = fwBufMc + fwOff + ucodeOff;
++        const uint32_t u[4] = {static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32),
++                               ucodeSize, kPspFwTypeVcn};
++        uint64_t pspOut[4] = {};
++        const IOReturn r = pspRunCmd(PHX_PSP_GFX_CMD_LOAD_IP_FW, u, 4, pspOut);
++        out[1] = pspOut[0];
++        if (r != kIOReturnSuccess || pspOut[0] != 0)
++            return PHX_VCN_PSP;
++        fwMc = (pspOut[3] << 32) | pspOut[2];
++        if (!fwMc)
++            return PHX_VCN_NO_FW_ADDR;
++    }
++    out[4] = fwMc;
++    if (!firmwareFitsTmr(fwMc, firmwareCacheBytes(ucodeSize), tmrMc, tmrSize))
++        return preloadMc ? PHX_VCN_BAD_ARG : PHX_VCN_NO_FW_ADDR;
++    vcnFwMc = fwMc;
++    return PHX_VCN_OK;
++}
++
++IOReturn PhxBringup::vcnInit(uint32_t fwOff, uint32_t fwLen, uint64_t preloadMc, uint64_t out[8]) {
++    bzero(out, sizeof(uint64_t) * 8u);
++    if (!mmio || !fbAper || !vcnLock || !smuLock)
++        return kIOReturnNotReady;
++    IOLockLock(vcnLock);
++    uint32_t code = PHX_VCN_OK;
++    vcnRecord(out);
++    if (isSleeping) {
++        code = PHX_VCN_NOT_READY;
++    } else if (vcnReady) {
++        code = PHX_VCN_ALREADY;
++        out[4] = vcnFwMc;
++    } else if (fbAperLen < static_cast<uint64_t>(kBoOffset) + kBoSize ||
++               fbSize < static_cast<uint64_t>(kBoOffset) + kBoSize || !vcnRegOk(kRegLmiCtrl)) {
++        // LMI_CTRL has the largest MMIO offset used in this sequence.
++        code = PHX_VCN_BAD_ARG;
++    } else {
++        uint32_t response = 0;
++        if (vcnNeedsPowerDown && !vcnPowerDown(&response)) {
++            code = PHX_VCN_POWERDOWN;
++            out[1] = response;
++        } else {
++            IOLockLock(smuLock);
++            code = vcnLoadFirmware(fwOff, fwLen, preloadMc, out);
++            IOLockUnlock(smuLock);
++            if (code == PHX_VCN_OK) {
++                code = vcnPowerUp(static_cast<uint32_t>(out[3]), out);
++                if (code != PHX_VCN_OK)
++                    vcnFwMc = 0;
++            }
++        }
++    }
++    out[0] = static_cast<uint64_t>(code);
++    out[7] |= static_cast<uint64_t>(vcnRingWptr) << 32;
++    IOLog("PhxBringup: VCN init code %u (detail 0x%llx, firmware MC 0x%llx, status 0x%08x)\n", code,
++          (unsigned long long)out[1], (unsigned long long)out[4], static_cast<uint32_t>(out[5]));
++    IOLockUnlock(vcnLock);
++    return kIOReturnSuccess;
++}
++
++// The diagnostic queue has one producer and one synchronous batch in flight. Wait for END and fetch padding
++// before reusing the ring. The Linux unified ring wraps its 32-bit write pointer at the ring size.
++uint32_t PhxBringup::vcnSubmitTest(const uint32_t *packet, uint32_t count, uint32_t seq,
++                                   uint32_t *before, uint32_t *after, uint32_t *observed) {
++    if (!vcnReady || isSleeping)
++        return PHX_VCN_NOT_READY;
++    const uint32_t enabled = rreg(kRegRbEnable);
++    if (enabled == UINT32_MAX || !(enabled & kRbEnableRb1))
++        return PHX_VCN_RING_NOT_ENABLED;
++    *before = *after = rreg(kRegRbRptr);
++    if (*before != vcnRingWptr)
++        return PHX_VCN_RPTR_STUCK;
++
++    const uint32_t ringBase = kBoOffset + kRingOff;
++    const uint32_t committed = ringCommitAfter(vcnRingWptr, count);
++    for (uint32_t i = 0; i < committed - vcnRingWptr; i++) {
++        const uint32_t slot = ringSlot(vcnRingWptr + i);
++        vcnWriteVram(ringBase + slot * 4u, i < count ? packet[i] : kCmdNop);
++    }
++    if (seq)
++        vcnWriteVram(kBoOffset + kWbOff, 0);
++    __asm__ __volatile__("sfence" ::: "memory");
++    hdpFlush();
++    vcnRingWptr = ringSlot(committed);
++    wreg(kRegRbWptr, vcnRingWptr);
++    const bool wptrOk = rreg(kRegRbWptr) == vcnRingWptr;
++    for (uint32_t i = 0; i < 1000u; i++) {
++        *after = rreg(kRegRbRptr);
++        if (seq)
++            *observed = vcnReadVram(kBoOffset + kWbOff);
++        if (*after == vcnRingWptr && (!seq || *observed == seq))
++            return PHX_VCN_OK;
++        IOSleep(1);
++    }
++    if (!wptrOk)
++        return PHX_VCN_WPTR_REJECTED;
++    if (seq && *observed != seq)
++        return PHX_VCN_FENCE_TIMEOUT;
++    return PHX_VCN_RPTR_STUCK;
++}
++
++IOReturn PhxBringup::vcnRingTest(uint64_t out[8]) {
++    bzero(out, sizeof(uint64_t) * 8u);
++    if (!mmio || !fbAper || !vcnLock)
++        return kIOReturnNotReady;
++    IOLockLock(vcnLock);
++    uint32_t before = 0, after = 0, observed = 0;
++    out[0] = vcnSubmitTest(&kCmdEnd, 1, 0, &before, &after, &observed);
++    out[1] = before;
++    out[2] = after;
++    out[3] = vcnRingWptr;
++    vcnRecord(out);
++    out[7] |= static_cast<uint64_t>(vcnRingWptr) << 32;
++    if (vcnReady) {
++        out[4] = (vcnReadVram(kBoOffset + kSharedOff + kSharedSq) >> 16) & 0xFFu;
++        if (out[0] != PHX_VCN_OK) {
++            uint32_t response = 0;
++            vcnPowerDown(&response);
++        }
++    }
++    IOLockUnlock(vcnLock);
++    return kIOReturnSuccess;
++}
++
++IOReturn PhxBringup::vcnFenceTest(uint64_t out[8]) {
++    bzero(out, sizeof(uint64_t) * 8u);
++    if (!mmio || !fbAper || !vcnLock)
++        return kIOReturnNotReady;
++    IOLockLock(vcnLock);
++    if (++vcnFenceSeq == 0)
++        ++vcnFenceSeq;
++    uint32_t packet[kFenceDwords];
++    buildFencePacket(packet, vcnMc(kBoOffset + kWbOff), vcnFenceSeq);
++    uint32_t before = 0, after = 0, observed = 0;
++    out[0] = vcnSubmitTest(packet, kFenceDwords, vcnFenceSeq, &before, &after, &observed);
++    out[1] = vcnFenceSeq;
++    out[2] = observed;
++    out[4] = before;
++    out[5] = after;
++    if (!isSleeping) {
++        out[6] = vcnRegOk(kRegUvdStatus) ? rreg(kRegUvdStatus) : 0;
++        out[7] = vcnRegOk(kRegPgfsmStatus) ? rreg(kRegPgfsmStatus) : 0;
++    }
++    if (vcnReady && out[0] != PHX_VCN_OK) {
++        uint32_t response = 0;
++        vcnPowerDown(&response);
++    }
++    IOLockUnlock(vcnLock);
++    return kIOReturnSuccess;
++}
++
++IOReturn PhxBringup::vcnShutdown(uint64_t out[8]) {
++    bzero(out, sizeof(uint64_t) * 8u);
++    if (!mmio || !fbAper || !vcnLock)
++        return kIOReturnNotReady;
++    IOLockLock(vcnLock);
++    if (isSleeping || !vcnNeedsPowerDown) {
++        out[0] = PHX_VCN_NOT_READY;
++    } else {
++        uint32_t response = 0;
++        out[0] = vcnPowerDown(&response) ? PHX_VCN_OK : PHX_VCN_POWERDOWN;
++        out[1] = response;
++    }
++    vcnRecord(out);
++    IOLockUnlock(vcnLock);
++    return kIOReturnSuccess;
++}
++
+ bool PhxBringup::claimSession() { return OSCompareAndSwap(0, 1, &sessionOpen); }
+ 
+ void PhxBringup::releaseSession() { OSCompareAndSwap(1, 0, &sessionOpen); }
+@@ -1461,6 +1937,7 @@
+         case PHXN_SEL_DBG_SYSMEM: r = doDbgSysMem(a); break;
+         case PHXN_SEL_DBG_ADOPTQ: r = doDbgAdoptQueue(a); break;
+         case PHXN_SEL_DBG_CLAIM: r = doDbgClaim(a); break;
++        case PHXN_SEL_DBG_VCN:   r = doDbgVcn(a); break;
+         default:                 r = kIOReturnBadArgument; break;
+         }
+     }
+@@ -2082,7 +2559,49 @@
+         return kIOReturnBadArgument;
+     return owner->claimAccel();
+ }
++
+ 
++// Selector 120: VCN 4.0.2 bring-up (root + phxdebug only). op 1 status, 2 init, 3 ring test, 4 power down; see
++// PHXN_SEL_DBG_VCN in PhxNativeABI.h for the eight output words.
++IOReturn IOAccelPhxNativeClient::doDbgVcn(IOExternalMethodArguments *a) {
++    if (!owner->debugEnabled())
++        return kIOReturnUnsupported;
++    if (!privileged)
++        return kIOReturnNotPrivileged;
++    if (!shape(a, 5, 8, 0, 0))
++        return kIOReturnBadArgument;
++    uint64_t out[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    IOReturn r;
++    switch (a->scalarInput[0]) {
++    case 1:
++        r = owner->vcnStatus(out);
++        break;
++    case 2: {
++        if (a->scalarInput[1] > 0xFFFFFFFFull || a->scalarInput[2] > 0xFFFFFFFFull ||
++            a->scalarInput[3] > 0xFFFFFFFFull || a->scalarInput[4] > 0xFFFFFFFFull)
++            return kIOReturnBadArgument;
++        const uint64_t tmr = (a->scalarInput[4] << 32) | a->scalarInput[3];
++        r = owner->vcnInit(static_cast<uint32_t>(a->scalarInput[1]), static_cast<uint32_t>(a->scalarInput[2]), tmr,
++                           out);
++        break;
++    }
++    case 3:
++        r = owner->vcnRingTest(out);
++        break;
++    case 4:
++        r = owner->vcnShutdown(out);
++        break;
++    case 5:
++        r = owner->vcnFenceTest(out);
++        break;
++    default:
++        return kIOReturnBadArgument;
++    }
++    for (uint32_t i = 0; i < 8u; i++)
++        a->scalarOutput[i] = out[i];
++    return r;
++}
++
+ // Write back and invalidate the CPU caches over every BO: CPU-written data must be in memory before the GPU reads
+ // it, and the CPU must not read stale lines after the GPU wrote. Coarse: WindowServer's BOs (full-screen surfaces
+ // among them) made this its hottest loop, hence debug.phxbos_flush.
+@@ -2119,7 +2638,8 @@
+ };
+ static_assert(sizeof(PhxSurfShareEsc) == 40, "NVRMSurfShareEsc layout");
+ IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
+-    if (!shape(a, 2, 1, 0, 0))
++    // Third scalar is optional on old plugins: 0 = legacy one-bit mark, the accelerator assigns and returns a number.
++    if (!shape(a, 2, 1, 0, 0) && !shape(a, 3, 1, 0, 0))
+         return kIOReturnBadArgument;
+     static IOService *accel;
+     static const OSSymbol *fn;
+@@ -2140,7 +2660,9 @@
+     PhxSurfShareEsc e{};
+     e.version = 2;
+     e.surfaceID = static_cast<uint32_t>(a->scalarInput[0]);
+-    e.plane = 0x80000000u | (a->scalarInput[1] ? 1u : 0u);   // NVRM_SS_PLANE_GPU_MARK | pending
++    const uint32_t seq = a->scalarInputCount >= 3 ? static_cast<uint32_t>(a->scalarInput[2]) : 0u;
++    e.plane = 0x80000000u | (a->scalarInput[1] ? 1u : 0u) | ((seq << 2) & 0x3ffffffcu);
++    // NVRM_SS_PLANE_GPU_MARK | pending | numbered mark (bits 2..29)
+     e.status = 0x80000002u;                                    // NVRM_SS_OFF unless the accelerator answers
+     const IOReturn r = accel->callPlatformFunction(fn, false, &e, task, reinterpret_cast<void *>(0xE3), nullptr);   // NVRM_ESC_SURF_DIRTY
+     a->scalarOutput[0] = r == kIOReturnSuccess ? e.status : 0x80000002u;
+--- a/src/phxbringup/PhxNativeABI.h
++++ b/src/phxbringup/PhxNativeABI.h
+@@ -38,7 +38,8 @@
+     PHXN_SEL_SUBMIT    = 7,
+     PHXN_SEL_WAITSEQ   = 8,
+     PHXN_SEL_TOPOLOGY  = 30,
+-    PHXN_SEL_SURF_GPU_MARK = 22,   /* in: [0] IOSurface id [1] 1 pending, 0 ready -> out [0] the accelerator's answer (0 taken):
++    PHXN_SEL_SURF_GPU_MARK = 22,   /* in: [0] IOSurface id [1] 1 pending, 0 ready [2] mark number (optional; 0 on
++                                      pending = assign one) -> out [0] assigned mark number, 0 = legacy accepted:
+                                       WindowServer's composite marks, handed to PhxAccel's NMXAccel (nvSurfVram) */
+     PHXN_SEL_BOIMPORTHOST = 21,    /* ABI 1.9: in [0] host VA [1] size [2] flags 0 [3] GPU VA 0 -> out [0] handle [1] size [2] 0 [3] bits */
+     /* Phoenix-only debug selectors: root, and only with the boot-arg phxdebug=1. */
+@@ -66,8 +67,38 @@
+     PHXN_SEL_DBG_CLAIM = 113,      /* in: [0] 1 = mark the GPU driven (nmxgpu-claimed) and re-run matching so PhxAccel starts. */
+     PHXN_SEL_DBG_SYSMEM = 111,     /* in: [0] op (1 alloc [1] bytes, 2 read [1] off, 3 write [1] off [2] val, 4 free)  out: [0] phys  [1] len/value */
+     PHXN_SEL_DBG_DOORBELL = 110,   /* in: [0] doorbell BAR2 byte offset (8-aligned) [1] value lo [2] value hi; writes a 64-bit doorbell. */
++    PHXN_SEL_DBG_VCN = 120,        /* VCN 4.0.2 bring-up (hard-coded Phoenix), root + phxdebug=1. in (5 scalars):
++                                      [0] op (1 status, 2 init [1] fw_buf offset [2] length [3] TMR lo [4] TMR hi,
++                                      3 ring test, 4 power down, 5 fence test);
++                                      out (8) per op — 1 status: [0] up, [1] fw_shared present_flag_0,
++                                      [2] fw_shared sq dword, [4] fw TMR MC, [5] UVD_STATUS, [6] PGFSM_STATUS,
++                                      [7] rptr | wptr << 32; 2 init: [0] code, [1] detail (PSP status / SMU
++                                      response), [2] ucode offset, [3] ucode size, [4] fw TMR MC, [5] UVD_STATUS,
++                                      [6] PGFSM_STATUS, [7] rptr | wptr << 32; 3 ring test: [1] rptr before,
++                                      [2] rptr after, [3] wptr, [4] fw queue_status, [5] UVD_STATUS, [6]
++                                      PGFSM_STATUS, [7] rptr | wptr << 32; 4 down: [0] code, [1] SMU response, status fields;
++                                      5 fence test: [1] seq, [2] observed 32-bit fence, [3] reserved (zero),
++                                      [4] rptr before, [5] rptr after, [6] UVD_STATUS, [7] PGFSM_STATUS. */
+ };
+ 
++/* PHXN_SEL_DBG_VCN result codes (out[0]); 0 is success. Failures after power-up trigger a power-down request. */
++#define PHX_VCN_OK           0u
++#define PHX_VCN_ALREADY      1u   /* already up; status fields still valid */
++#define PHX_VCN_NOT_READY    2u   /* no MMIO/BAR0, or the PSP ring / fw_buf was never created */
++#define PHX_VCN_BAD_ARG      3u   /* fw offset/length outside fw_buf, or the VCN VRAM block is not mappable */
++#define PHX_VCN_BAD_FW       4u   /* staged bytes are not a VCN 4.0 image (header check failed) */
++#define PHX_VCN_PSP          5u   /* LOAD_IP_FW failed or timed out; out[1] = PSP status, 0xFFFFFFFF = no fence */
++#define PHX_VCN_NO_FW_ADDR   6u   /* PSP answered but returned no usable TMR address */
++#define PHX_VCN_SMU          7u   /* SMU did not acknowledge PowerUpVcn; out[1] = response register */
++#define PHX_VCN_NO_POWER     8u   /* VCN planes never reported powered; out[6] = PGFSM_STATUS */
++#define PHX_VCN_NO_BLOCK     9u   /* VCN registers read all-ones after power-up */
++#define PHX_VCN_NO_VCPU     10u   /* the VCPU never reported firmware ready; out[5] = UVD_STATUS */
++#define PHX_VCN_POWERDOWN   11u   /* cleanup or power-down request failed */
++#define PHX_VCN_RING_NOT_ENABLED 12u   /* VCN_RB_ENABLE.RB1_EN reads back 0 */
++#define PHX_VCN_RPTR_STUCK  13u   /* UVD_RB_RPTR did not reach the write pointer (1 s) */
++#define PHX_VCN_FENCE_TIMEOUT 14u /* the firmware did not write the fence value into the WB slot (1 s) */
++#define PHX_VCN_WPTR_REJECTED 15u /* UVD_RB_WPTR did not read back what was written; nothing will be consumed */
++
+ /* GPU memory layout registers (MMHUB 3.0.1 segment 1 = 0x1A000): Linux mmhub_v3_0_1_get_fb_location / get_mc_fb_offset */
+ #define PHX_MMMC_VM_FB_LOCATION_BASE 0x1A8ECu
+ #define PHX_MMMC_VM_FB_LOCATION_TOP  0x1A8EDu
+--- /dev/null
++++ b/src/phxbringup/PhxVcn.h
+@@ -0,0 +1,213 @@
++/*
++ * PhxVcn.h — hard-coded VCN 4.0.2 (Phoenix / Radeon 780M) bring-up constants.
++ *
++ * Every number here is taken from the VCN instance 0 discovered on this machine (IP discovery:
++ * VCN v4.0.2, bases 0x7800 / 0x7e00 dwords) and from the upstream Linux sources that drive
++ * exactly this block: drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c, amdgpu_vcn.{c,h},
++ * include/asic_reg/vcn/vcn_4_0_0_{offset,sh_mask}.h (all MIT).
++ *
++ * Nothing here is discovered at runtime: Phoenix has one VCN instance at a fixed address, and the
++ * register set is fixed. tests/vcn_regs_check.py re-parses the upstream register headers and
++ * compares them with the values below, so a typo cannot survive the test.
++ *
++ * This header is self-contained (stdint + macros only) so both the kext and host tests can use it.
++ */
++#ifndef PHX_VCN_H
++#define PHX_VCN_H
++
++#include <stdint.h>
++
++namespace phx_vcn {
++
++// ---------------------------------------------------------------------------------------------------------------
++// Register block. SOC15 maps VCN instance 0 to dword offsets 0x7800 (segment 0) and 0x7e00 (segment 1); the
++// per-register offsets below already include their segment base (that is what regUVD_*_BASE_IDX selects).
++// ---------------------------------------------------------------------------------------------------------------
++constexpr uint32_t kBase0 = 0x7800u;   // VCN segment 0
++constexpr uint32_t kBase1 = 0x7e00u;   // VCN segment 1
++
++constexpr uint32_t kRegPgfsmConfig     = kBase1 + 0x0000u;   // 0x7e00
++constexpr uint32_t kRegPgfsmStatus     = kBase1 + 0x0001u;   // 0x7e01
++constexpr uint32_t kRegPowerStatus     = kBase1 + 0x0002u;   // 0x7e02
++constexpr uint32_t kRegUvdStatus       = kBase0 + 0x0743u;   // 0x7f43
++constexpr uint32_t kRegVcpuCntl        = kBase0 + 0x0796u;   // 0x7f96
++constexpr uint32_t kRegMastintEn       = kBase1 + 0x00e1u;   // 0x7ee1
++constexpr uint32_t kRegLmiCtrl2        = kBase0 + 0x08aeu;   // 0x80ae
++constexpr uint32_t kRegSoftReset       = kBase0 + 0x0747u;   // 0x7f47
++constexpr uint32_t kRegLmiCtrl         = kBase0 + 0x08b0u;   // 0x80b0
++constexpr uint32_t kRegMpcCntl         = kBase0 + 0x07d4u;   // 0x7fd4
++constexpr uint32_t kRegMpcSetMuxA0     = kBase0 + 0x07d6u;   // 0x7fd6
++constexpr uint32_t kRegMpcSetMuxB0     = kBase0 + 0x07d8u;   // 0x7fd8
++constexpr uint32_t kRegMpcSetMux       = kBase0 + 0x07dau;   // 0x7fda
++constexpr uint32_t kRegLmiVcpuCacheBarLo   = kBase0 + 0x0844u;   // 0x8044
++constexpr uint32_t kRegLmiVcpuCacheBarHi   = kBase0 + 0x0845u;   // 0x8045
++constexpr uint32_t kRegVcpuCacheOffset0    = kBase0 + 0x0780u;   // 0x7f80
++constexpr uint32_t kRegVcpuCacheSize0      = kBase0 + 0x0781u;   // 0x7f81
++constexpr uint32_t kRegLmiVcpuCache1BarLo  = kBase0 + 0x0870u;   // 0x8070
++constexpr uint32_t kRegLmiVcpuCache1BarHi  = kBase0 + 0x0871u;   // 0x8071
++constexpr uint32_t kRegVcpuCacheOffset1    = kBase0 + 0x0782u;   // 0x7f82
++constexpr uint32_t kRegVcpuCacheSize1      = kBase0 + 0x0783u;   // 0x7f83
++constexpr uint32_t kRegLmiVcpuCache2BarLo  = kBase0 + 0x0874u;   // 0x8074
++constexpr uint32_t kRegLmiVcpuCache2BarHi  = kBase0 + 0x0875u;   // 0x8075
++constexpr uint32_t kRegVcpuCacheOffset2    = kBase0 + 0x0784u;   // 0x7f84
++constexpr uint32_t kRegVcpuCacheSize2      = kBase0 + 0x0785u;   // 0x7f85
++constexpr uint32_t kRegLmiVcpuNc0BarLo     = kBase0 + 0x0840u;   // 0x8040
++constexpr uint32_t kRegLmiVcpuNc0BarHi     = kBase0 + 0x0841u;   // 0x8041
++constexpr uint32_t kRegVcpuNoncacheOffset0 = kBase0 + 0x0792u;   // 0x7f92
++constexpr uint32_t kRegVcpuNoncacheSize0   = kBase0 + 0x0793u;   // 0x7f93
++constexpr uint32_t kRegGfx10AddrConfig     = kBase1 + 0x0042u;   // 0x7e42
++constexpr uint32_t kRegRbArbCtrl           = kBase0 + 0x0706u;   // 0x7f06
++constexpr uint32_t kRegRb1DbCtrl           = kBase1 + 0x0072u;   // 0x7e72
++constexpr uint32_t kRegRbBaseLo            = kBase1 + 0x00eau;   // 0x7eea
++constexpr uint32_t kRegRbBaseHi            = kBase1 + 0x00ebu;   // 0x7eeb
++constexpr uint32_t kRegRbSize              = kBase1 + 0x00ecu;   // 0x7eec
++constexpr uint32_t kRegRbEnable            = kBase1 + 0x0085u;   // 0x7e85
++constexpr uint32_t kRegRbRptr              = kBase1 + 0x00acu;   // 0x7eac
++constexpr uint32_t kRegRbWptr              = kBase1 + 0x00adu;   // 0x7ead
++
++// ---------------------------------------------------------------------------------------------------------------
++// Field values (vcn_4_0_0_sh_mask.h and the engine_status_constants enum in amdgpu_vcn.h).
++// ---------------------------------------------------------------------------------------------------------------
++constexpr uint32_t kPgfsmStatusMask   = 0x3F3FFFFFu;
++constexpr uint32_t kPgfsmPoweredNoPg  = 0x2A2A8AA0u;   // UVD_PGFSM_STATUS__UVDM_UVDU_UVDLM_PWR_ON_3_0
++constexpr uint32_t kPgfsmPoweredPg    = 0x00000000u;   // static power gating on: all planes on
++constexpr uint32_t kPgfsmConfigNoPg   = 0x15155555u;   // "1" (power on) in all 14 PWR_CONFIG fields
++constexpr uint32_t kPgfsmConfigPg     = 0x2A2AAAAAu;   // "2" (power on with PG) in all 14 fields
++constexpr uint32_t kPowerStatusKeep   = ~0x103u;       // Linux: data &= ~0x103
++constexpr uint32_t kPowerStatusPgOn   = 0x2u | 0x100u; // UVDM_UVDU_PWR_ON | UVD_PG_EN
++constexpr uint32_t kUvdStatusBusy     = 0x00000004u;   // UVD_STATUS__UVD_BUSY
++constexpr uint32_t kUvdStatusVcpuRdy  = 0x00000002u;   // bit 1: VCPU reported firmware ready
++constexpr uint32_t kVcpuCntlClkEn     = 0x00000200u;
++constexpr uint32_t kVcpuCntlBlkRst    = 0x10000000u;
++constexpr uint32_t kMastintEnVcpuEn   = 0x00000002u;
++constexpr uint32_t kLmiCtrl2StallUmc  = 0x00000100u;
++constexpr uint32_t kSoftResetLmi      = 0x00000004u;
++constexpr uint32_t kSoftResetLmiUmc   = 0x00002000u;
++constexpr uint32_t kLmiCtrlFlags      = 0x00000100u | 0x00001000u | 0x00002000u | 0x00200000u;
++constexpr uint32_t kMpcCntlReplMask   = 0x00000038u;
++constexpr uint32_t kMpcCntlReplShift  = 3u;
++constexpr uint32_t kMpcCntlReplMode   = 2u;
++constexpr uint32_t kRbArbCtrlVcpuDis  = 0x00000008u;
++constexpr uint32_t kRb1DbCtrlOffsetShift = 2u;
++constexpr uint32_t kRb1DbCtrlEn       = 0x40000000u;
++constexpr uint32_t kRbEnableRb1       = 0x00000004u;
++
++// UVD_MPC_SET_MUX{A,B}0 / SET_MUX constant data (vcn_v4_0_start): 1,2,3,4 in the four VAR fields.
++constexpr uint32_t kMpcSetMuxA =
++    (1u << 6) | (2u << 12) | (3u << 18) | (4u << 24);
++constexpr uint32_t kMpcSetMuxB =
++    (1u << 6) | (2u << 12) | (3u << 18) | (4u << 24);
++constexpr uint32_t kMpcSetMux = (0u << 0) | (1u << 3) | (2u << 6);
++
++// fw_shared (struct amdgpu_vcn4_fw_shared, sizeof 148, page-aligned by Linux). Offsets are byte offsets.
++constexpr uint32_t kSharedPresentFlags = 0u;     // present_flag_0 precedes 12 reserved bytes
++constexpr uint32_t kSharedSq           = 16u;   // is_enabled (+0), queue_mode (+1), queue_status (+2)
++constexpr uint32_t kSharedSqEnabled    = 1u;
++constexpr uint32_t kSharedSmuInterface = 120u;  // smu_interface_type = 1 (APU)
++constexpr uint32_t kSharedDrmKey       = 124u;  // method = 2 (VCNFW/ASD handshaking workaround)
++constexpr uint32_t kSharedSize         = 4096u; // AMDGPU_GPU_PAGE_ALIGN(sizeof(...))
++
++constexpr uint32_t kFwFlagUnifiedQueue = 1u << 2;
++constexpr uint32_t kFwFlagDrmKeyInject = 1u << 4;
++constexpr uint32_t kFwFlagSmuDpm       = 1u << 11;
++constexpr uint32_t kFwDrmKeyMethod     = 2u;
++constexpr uint32_t kFwSmuInterfaceApu  = 1u;
++constexpr uint32_t kFwQueueRingReset   = 1u;
++constexpr uint32_t kFwQueueDpgHoldOff  = 2u;
++
++// Unified ring (amdgpu_ring_init(..., 512 dw)): 512 dwords = 2048 B, 64-byte aligned, metadata 36 B after it.
++constexpr uint32_t kRingDw     = 512u;
++constexpr uint32_t kRingBytes  = kRingDw * 4u;
++constexpr uint32_t kRingAlign  = 64u;
++constexpr uint32_t kRbMetadataBytes = 36u;
++constexpr uint32_t kRingCommitAlignDw = 64u;     // vcn_v4_0_unified_ring_vm_funcs.align_mask + 1
++constexpr uint32_t kCmdNop     = 0x00000000u;   // VCN_ENC_CMD_NO_OP
++constexpr uint32_t kCmdEnd     = 0x00000001u;   // VCN_ENC_CMD_END
++constexpr uint32_t kCmdFence   = 0x00000003u;   // VCN_ENC_CMD_FENCE
++constexpr uint32_t kFenceDwords = 5u;           // FENCE, addr lo/hi, seq, END (polled, no interrupt)
++
++// VRAM layout of the per-instance block (byte offsets inside the 256 MiB BAR0 aperture):
++// stack 128 KiB, context 512 KiB, fw_shared 4 KiB, ring 2 KiB + metadata. 200 MiB leaves the 64 MiB TMR
++// (0x8000000..0xC000000) and everything below it untouched.
++constexpr uint32_t kBoOffset  = 0xC800000u;   // 200 MiB
++constexpr uint32_t kBoSize    = 0x100000u;    // 1 MiB
++constexpr uint32_t kStackOff  = 0x00000u;
++constexpr uint32_t kStackSize = 128u * 1024u;
++constexpr uint32_t kCtxOff    = kStackOff + kStackSize;   // 0x20000
++constexpr uint32_t kCtxSize   = 512u * 1024u;
++constexpr uint32_t kSharedOff = kCtxOff + kCtxSize;       // 0xA0000
++constexpr uint32_t kRingOff   = kSharedOff + kSharedSize; // 0xA1000
++constexpr uint32_t kMetaOff   = kRingOff + kRingBytes;    // 0xA1800
++constexpr uint32_t kWbOff     = 0xB0000u;                 // 32-bit fence value the firmware writes
++constexpr uint32_t kWbSize    = 4u;
++
++// PSP LOAD_IP_FW firmware type for VCN (psp_gfx_if.h: GFX_FW_TYPE_VCN = 13).
++constexpr uint32_t kPspFwTypeVcn = 13u;
++// SMU 13.0.4 messages (smu_v13_0_4_ppsmc.h).
++constexpr uint32_t kPpsmcPowerDownVcn = 0x06u;
++constexpr uint32_t kPpsmcPowerUpVcn   = 0x07u;
++constexpr uint32_t kPpsmcResultOk     = 0x01u;
++
++// common_firmware_header (amdgpu_ucode.h), the 32 bytes at the start of vcn_4_0_0.bin.
++struct FwHeader {
++    uint32_t sizeBytes;
++    uint32_t headerSizeBytes;
++    uint16_t headerVersionMajor;
++    uint16_t headerVersionMinor;
++    uint16_t ipVersionMajor;
++    uint16_t ipVersionMinor;
++    uint32_t ucodeVersion;
++    uint32_t ucodeSizeBytes;
++    uint32_t ucodeArrayOffsetBytes;
++    uint32_t crc32;
++};
++static_assert(sizeof(FwHeader) == 32, "common_firmware_header is 32 bytes");
++
++// Rejects anything that is not the VCN 4.0 image this block runs: header v1.0, IP 4.0, a 4-byte aligned
++// ucode array that lies inside the buffer, and a non-empty ucode that ends inside it. Pure function so the
++// host test can feed it the real vcn_4_0_0.bin header plus a set of broken ones.
++inline bool fwHeaderOk(const FwHeader &h, uint32_t fileLen, uint32_t *ucodeOff, uint32_t *ucodeSize) {
++    if (h.headerSizeBytes != 32u || h.headerVersionMajor != 1u || h.headerVersionMinor != 0u)
++        return false;
++    if (h.ipVersionMajor != 4u || h.ipVersionMinor != 0u)
++        return false;
++    if (h.ucodeArrayOffsetBytes < h.headerSizeBytes || (h.ucodeArrayOffsetBytes & 3u))
++        return false;
++    if (h.ucodeSizeBytes == 0u || h.ucodeSizeBytes > (16u << 20))
++        return false;
++    // 64-bit arithmetic: a corrupt header must not wrap the bounds check.
++    const uint64_t end = static_cast<uint64_t>(h.ucodeArrayOffsetBytes) + h.ucodeSizeBytes;
++    if (h.sizeBytes != fileLen || end > fileLen)
++        return false;
++    *ucodeOff = h.ucodeArrayOffsetBytes;
++    *ucodeSize = h.ucodeSizeBytes;
++    return true;
++}
++
++inline uint32_t firmwareCacheBytes(uint32_t ucodeSize) {
++    return (ucodeSize + 8u + 0xFFFu) & ~0xFFFu;
++}
++
++inline bool firmwareFitsTmr(uint64_t fwMc, uint32_t cacheBytes, uint64_t tmrMc, uint64_t tmrBytes) {
++    return fwMc != 0 && fwMc >= tmrMc && cacheBytes != 0 &&
++           cacheBytes <= tmrBytes && fwMc - tmrMc <= tmrBytes - cacheBytes;
++}
++
++inline uint32_t ringSlot(uint32_t ptr) { return ptr & (kRingDw - 1u); }
++
++inline uint32_t ringCommitAfter(uint32_t wptr, uint32_t packetDw) {
++    return (wptr + packetDw + kRingCommitAlignDw - 1u) & ~(kRingCommitAlignDw - 1u);
++}
++
++// The diagnostic ring uses a polled 32-bit fence, so it omits Linux's trailing interrupt TRAP.
++inline void buildFencePacket(uint32_t dw[kFenceDwords], uint64_t mc, uint32_t seq) {
++    dw[0] = kCmdFence;
++    dw[1] = static_cast<uint32_t>(mc);
++    dw[2] = static_cast<uint32_t>(mc >> 32);
++    dw[3] = seq;
++    dw[4] = kCmdEnd;
++}
++
++} // namespace phx_vcn
++
++#endif // PHX_VCN_H
