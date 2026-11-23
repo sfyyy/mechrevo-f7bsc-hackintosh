@@ -105,6 +105,18 @@ shell_sim_test.sh 在临时目录模拟 ESP 和 IOKit，检查 BO 映射、原�
     /tmp/phx-vt-roundtrip
     /tmp/phx-vt-roundtrip --software
 
-在有多个 GPU 的机器上用 --gpu-id ID 指定 Phoenix 的 GPU registry ID。软件模式用于对照验收。当前机器的 H.264 和 HEVC 软件往返均通过，四项硬件会话的创建均失败。
+在有多个 GPU 的机器上用 --gpu-id ID 指定 Phoenix 的 GPU registry ID。软件模式用于对照验收。build 64/65 上 H.264 和 HEVC 的软件往返均通过，四项硬件会话的创建均失败；build 75 已单独完成 H.264 硬件解码性能与正确性对照，HEVC 硬件路径仍未实现。
 
 默认模式验收系统可发现的编码器和解码器，最终要求 H.264、HEVC 各完成 8 帧硬件编码和解码。进程内 H.264 验收单独使用上文的 `--phx-avc` 模式。
+
+## 解码性能与优化
+
+build 75 上已用同一份 H.264 码流对比软件解码与 Phoenix VCN。实时 30 fps 播放时，1080p 的单核 CPU 降低 41%，540p 降低 29%，两种模式均无帧错误。满速吞吐受 VCN 全局串行队列和每帧 `IOSleep(1)` 限制，但单路播放余量充足。
+
+后续优先项是复用未变化分辨率下的解码会话，将关键帧约 32 ms 的重建延迟降到个位数毫秒；其次是缩短 fence 等待。完整数据、尚未实施的优化计划及复现命令见 [解码性能与优化记录](BENCHMARKS.md)。
+
+    xcrun clang -std=c11 -O2 -Wall -Wextra -Werror vt-bench.c \
+        -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+        -framework CoreFoundation -o /tmp/vt-bench
+    /tmp/vt-bench --hardware stream.h264 1 --realtime 30
+    python3 perf-capture.py 90 results/perf-build75

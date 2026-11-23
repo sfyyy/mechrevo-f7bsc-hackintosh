@@ -583,11 +583,12 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 属于驱动整体性能工作，暂不继续；先做 VCN。临时缓解：投屏时少开最大化、带半透明侧栏的窗口。
 关掉统计：从 `nvrm610.conf` 删掉 `NVMTL_WS_GPUTIME=1`（关掉后零开销，重启生效）。
 
-## Radeon 780M 的应用硬编码需要进程内注册
+## Radeon 780M 的应用硬件编解码进展
 
 - 腾讯会议启动时记录 `no hw h264 encoder ablity` 和 `no hw hevc encoder ablity`，软件编码 2560×1440 HEVC 时 CPU 温度曾达 88–91 °C。向日葵远控日志报告 `support hevc 0`。
 - PhxBringup build 64 真机验收通过。普通用户程序注册 Phoenix 编码器后，VideoToolbox 完成了八帧 160×128 H.264 硬编码，独立软件解码通过亮度和色度校验。[接入说明](../macos/nullarc/vcn/README.md)
-- 全新进程未经注册直接要求系统硬件时，H.264 和 HEVC 的编码会话仍返回 `-12908`，解码会话仍返回 `-12906`。应用硬解码和 HEVC 仍待实现。
+- build 64/65 时，全新进程未经注册直接要求系统硬件时，H.264 和 HEVC 的编码会话返回 `-12908`，解码会话返回 `-12906`；进程内 H.264 编码已可用，HEVC 仍待实现。
+- build 75 的本机对照确认强制硬件路径实际使用 Phoenix VCN。实时 30 fps 播放时，1080p 和 540p 的单核 CPU 分别降低 41% 和 29%，所有测试模式均无帧错误。后续需要优化每关键帧约 32 ms 的会话重建延迟和 fence 等待。[性能记录](../macos/nullarc/vcn/BENCHMARKS.md)
 - 本机 26.7.1 的系统视频插件扫描会按 Apple 签名要求过滤 Phoenix。单独安装编码器 bundle 后，全新进程仍无法枚举它。腾讯会议实际用 r264 处理过 2048×1152 和 2560×1440 的全范围输入。build 65 候选已经支持这两档尺寸的参数与缓冲区，VCN 输出仍待上机验证。[测试结果](../macos/nullarc/vcn/NEXT.md)
 
 ### PhxBringup build 59：VCN 固件仍未能启动（2026-11-22 暂停）
