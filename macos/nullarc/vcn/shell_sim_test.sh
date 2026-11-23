@@ -163,7 +163,7 @@ grep -q '^CALL down' "$SIM/calls.log" || fail "power down not called"
 rm -f "$SIM/calls.log"; SIM_BUILD=61 bash "$SIM/vcn-test.sh" >/dev/null || fail "build 61 session tests"
 grep -q '^CALL decode-session' "$SIM/calls.log" || fail "decode-session missing"
 grep -q '^CALL encode-session' "$SIM/calls.log" || fail "encode-session missing"
-for build in 62 63 64; do
+for build in 62 63 64 65 66 67 68; do
     rm -f "$SIM/calls.log"
     SIM_BUILD="$build" bash "$SIM/vcn-test.sh" >/dev/null || fail "build $build frames"
     for op in decode-frame encode-frame; do

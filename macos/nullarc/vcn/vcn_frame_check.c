@@ -9,6 +9,11 @@
 
 enum { width = 160, height = 128, maxBytes = 28672 };
 
+typedef struct {
+    const uint8_t *reference;
+    bool matched;
+} Verification;
+
 static void decoded(void *context, void *source, OSStatus status, VTDecodeInfoFlags flags,
                     CVImageBufferRef image, CMTime pts, CMTime duration) {
     (void)source; (void)pts; (void)duration;
@@ -22,17 +27,29 @@ static void decoded(void *context, void *source, OSStatus status, VTDecodeInfoFl
     size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
     size_t uvPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
     bool valid = y && uv && pitch >= width && uvPitch >= width;
-    for (unsigned row = 0; row < 2 && valid; ++row) {
-        for (unsigned col = 0; col < 2; ++col) {
-            const unsigned x = (2 * col + 1) * width / 4, line = (2 * row + 1) * height / 4;
-            const uint8_t *chroma = uv + line / 2 * uvPitch + x;
-            const int expected = row == col ? 48 : 200;
-            valid &= abs(y[line * pitch + x] - expected) <= 20 &&
-                     abs(chroma[0] - 128) <= 20 && abs(chroma[1] - 128) <= 20;
+    Verification *verification = context;
+    if (verification->reference) {
+        const uint8_t *expectedY = verification->reference;
+        const uint8_t *expectedUV = expectedY + width * height;
+        for (unsigned row = 0; row < height && valid; ++row)
+            for (unsigned col = 0; col < width; ++col)
+                valid &= abs(y[row * pitch + col] - expectedY[row * width + col]) <= 16;
+        for (unsigned row = 0; row < height / 2 && valid; ++row)
+            for (unsigned col = 0; col < width; ++col)
+                valid &= abs(uv[row * uvPitch + col] - expectedUV[row * width + col]) <= 16;
+    } else {
+        for (unsigned row = 0; row < 2 && valid; ++row) {
+            for (unsigned col = 0; col < 2; ++col) {
+                const unsigned x = (2 * col + 1) * width / 4, line = (2 * row + 1) * height / 4;
+                const uint8_t *chroma = uv + line / 2 * uvPitch + x;
+                const int expected = row == col ? 48 : 200;
+                valid &= abs(y[line * pitch + x] - expected) <= 20 &&
+                         abs(chroma[0] - 128) <= 20 && abs(chroma[1] - 128) <= 20;
+            }
         }
     }
     CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-    *(bool *)context = valid;
+    verification->matched = valid;
 }
 
 /* The hardware probe produces a single IDR with in-band parameter sets. */
@@ -46,7 +63,7 @@ static size_t startCode(const uint8_t *data, size_t size, size_t start, size_t *
     return size;
 }
 
-static bool check(const uint8_t *data, size_t size) {
+static bool check(const uint8_t *data, size_t size, const uint8_t *reference) {
     size_t nal, begin = startCode(data, size, 0, &nal);
     for (size_t i = 0; i < begin; ++i) if (data[i]) return false;
     const uint8_t *sets[2] = {NULL, NULL};
@@ -78,7 +95,7 @@ static bool check(const uint8_t *data, size_t size) {
     CMBlockBufferRef block = NULL;
     CMSampleBufferRef sample = NULL;
     VTDecompressionSessionRef session = NULL;
-    bool matched = false;
+    Verification verification = {.reference = reference};
     const void *key = kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder;
     const void *value = kCFBooleanFalse;
     CFDictionaryRef spec = CFDictionaryCreate(NULL, &key, &value, 1, &kCFTypeDictionaryKeyCallBacks,
@@ -88,7 +105,7 @@ static bool check(const uint8_t *data, size_t size) {
     key = kCVPixelBufferPixelFormatTypeKey; value = px;
     CFDictionaryRef attrs = CFDictionaryCreate(NULL, &key, &value, 1, &kCFTypeDictionaryKeyCallBacks,
                                                 &kCFTypeDictionaryValueCallBacks);
-    VTDecompressionOutputCallbackRecord cb = {decoded, &matched};
+    VTDecompressionOutputCallbackRecord cb = {decoded, &verification};
     OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &format);
     if (!st) {
         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(format);
@@ -107,18 +124,28 @@ static bool check(const uint8_t *data, size_t size) {
     if (format) CFRelease(format);
     CFRelease(attrs); CFRelease(px); CFRelease(spec);
     if (st) fprintf(stderr, "AVC decode returned %d\n", (int)st);
-    return !st && matched;
+    return !st && verification.matched;
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fputs("usage: vcn_frame_check frame.h264\n", stderr); return 2; }
+    if (argc != 2 && argc != 3) { fputs("usage: vcn_frame_check frame.h264 [reference.nv12]\n", stderr); return 2; }
     FILE *file = fopen(argv[1], "rb");
     if (!file) { perror(argv[1]); return 1; }
     uint8_t data[maxBytes + 1];
     size_t size = fread(data, 1, sizeof(data), file);
     bool ok = !ferror(file) && size && size <= maxBytes;
     fclose(file);
-    if (!ok || !check(data, size)) { fputs("invalid AVC frame or unexpected NV12 pattern\n", stderr); return 1; }
-    puts("AVC software decode verified 160x128, four luma quadrants and neutral chroma");
+    uint8_t reference[width*height*3/2];
+    if (argc == 3) {
+        file = fopen(argv[2], "rb");
+        if (!file) { perror(argv[2]); return 1; }
+        bool complete = fread(reference, 1, sizeof(reference), file) == sizeof(reference) &&
+                        fgetc(file) == EOF && !ferror(file);
+        fclose(file);
+        if (!complete) { fputs("expected a single packed 160x128 NV12 reference frame\n",stderr); return 1; }
+    }
+    if (!ok || !check(data, size, argc == 3 ? reference : NULL)) { fputs("invalid AVC frame or unexpected NV12 pattern\n", stderr); return 1; }
+    puts(argc == 3 ? "AVC software decode verified all 30720 NV12 samples (absolute error <= 16)" :
+                     "AVC software decode verified 160x128, four luma quadrants and neutral chroma");
     return 0;
 }

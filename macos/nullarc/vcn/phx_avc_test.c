@@ -15,19 +15,23 @@ static const io_connect_t testConnection = 123;
 static uint8_t fixture[fixtureBytes], reply[fixtureBytes + 8], packed[PhxAVCInputBytes];
 static size_t replyBytes;
 static unsigned submissions;
+static CMVideoDimensions expected = {PhxAVCWidth, PhxAVCHeight};
 static OSStatus submitStatus;
 
-OSStatus PhxAVCSubmit(io_connect_t connection, const uint8_t *nv12, uint8_t *annexB, size_t *bytes) {
+OSStatus PhxAVCSubmit(io_connect_t connection, uint32_t width, uint32_t height,
+                      const uint8_t *nv12, uint8_t *annexB, size_t *bytes) {
     ++submissions;
-    CHECK(connection == testConnection && *bytes == PhxAVCMaxBytes);
-    CHECK(memcmp(nv12, packed, sizeof(packed)) == 0);
+    CHECK(width == (unsigned)expected.width && height == (unsigned)expected.height);
+    CHECK(connection == testConnection && *bytes == phxAVCOutputCapacity(width, height));
+    if (width == PhxAVCWidth && height == PhxAVCHeight)
+        CHECK(memcmp(nv12, packed, sizeof(packed)) == 0);
     if (submitStatus) return submitStatus;
     if (replyBytes <= sizeof(reply)) memcpy(annexB, reply, replyBytes);
     *bytes = replyBytes;
     return noErr;
 }
 
-static CVPixelBufferRef makeFrame(void) {
+static CVPixelBufferRef makeFrame(OSType format) {
     static uint8_t y[yStride * PhxAVCHeight], uv[uvStride * PhxAVCHeight / 2];
     void *planes[] = {y, uv};
     size_t widths[] = {PhxAVCWidth, PhxAVCWidth/2};
@@ -43,8 +47,14 @@ static CVPixelBufferRef makeFrame(void) {
         memcpy(uv + row * uvStride, packed + (row + PhxAVCHeight) * PhxAVCWidth, PhxAVCWidth);
     CVPixelBufferRef image = NULL;
     CHECK(CVPixelBufferCreateWithPlanarBytes(NULL, PhxAVCWidth, PhxAVCHeight,
-          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, 0, 2, planes, widths, heights, strides,
+          format, NULL, 0, 2, planes, widths, heights, strides,
           NULL, NULL, NULL, &image) == kCVReturnSuccess);
+    if (format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        for (size_t i = 0; i < sizeof(packed); ++i) {
+            const double span = i < PhxAVCWidth * PhxAVCHeight ? 219.0 : 224.0;
+            packed[i] = (uint8_t)(16.5 + packed[i] * span / 255.0);
+        }
+    }
     return image;
 }
 
@@ -59,11 +69,11 @@ static void checkInputs(CVPixelBufferRef image, CMTime pts, CMTime duration) {
     expectInvalid(testConnection, NULL, pts, duration);
     expectInvalid(testConnection, image, kCMTimeIndefinite, duration);
     expectInvalid(testConnection, image, pts, CMTimeMake(-1, 30));
-    const OSType formats[] = {kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    const OSType formats[] = {kCVPixelFormatType_420YpCbCr8Planar,
                               kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange};
     for (size_t i = 0; i < sizeof(formats)/sizeof(formats[0]); ++i) {
         CVPixelBufferRef bad = NULL;
-        size_t width = i == 2 ? PhxAVCWidth + 2 : PhxAVCWidth;
+        size_t width = i == 2 ? 96 : PhxAVCWidth;
         CHECK(CVPixelBufferCreate(NULL, width, PhxAVCHeight, formats[i], NULL, &bad) == kCVReturnSuccess);
         expectInvalid(testConnection, bad, pts, duration);
         CFRelease(bad);
@@ -183,7 +193,7 @@ int main(int argc, char **argv) {
     FILE *file = fopen(argv[1], "rb");
     CHECK(file && fread(fixture, 1, fixtureBytes, file) == fixtureBytes);
     CHECK(fgetc(file) == EOF && !ferror(file) && fclose(file) == 0);
-    CVPixelBufferRef image = makeFrame();
+    CVPixelBufferRef image = makeFrame(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
     CMTime pts = CMTimeMake(17, 30), duration = CMTimeMake(1, 30);
     checkInputs(image, pts, duration);
     checkReplies(image, pts, duration);
@@ -191,6 +201,11 @@ int main(int argc, char **argv) {
     memcpy(reply, fixture + 1, fixtureBytes - 1);
     memset(reply + fixtureBytes - 1, 0, 3);
     replyBytes = fixtureBytes + 2;
+    CFDataRef accessUnit = NULL;
+    CHECK(PhxAVCCopyAnnexB(testConnection, image, &accessUnit) == noErr && accessUnit);
+    CHECK((size_t)CFDataGetLength(accessUnit) == replyBytes);
+    CHECK(memcmp(CFDataGetBytePtr(accessUnit), reply, replyBytes) == 0);
+    CFRelease(accessUnit);
     CMSampleBufferRef first = NULL, second = NULL;
     CHECK(PhxAVCEncode(testConnection, image, pts, duration, &first) == noErr);
     CMTime next = CMTimeAdd(pts, duration);
@@ -201,6 +216,19 @@ int main(int argc, char **argv) {
     checkSample(first, pts, duration);
     if (argc == 3) checkSoftwareDecode(first);
     CFRelease(first);
-    puts("Phoenix AVC adapter host tests passed");
+    image = makeFrame(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    memcpy(reply, fixture, fixtureBytes);
+    replyBytes = fixtureBytes;
+    CHECK(PhxAVCEncode(testConnection, image, pts, duration, &second) == noErr);
+    checkSample(second, pts, duration);
+    CFRelease(second);
+    CFRelease(image);
+    expected = (CMVideoDimensions){960, 540};
+    CHECK(CVPixelBufferCreate(NULL, expected.width, expected.height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                              NULL, &image) == kCVReturnSuccess);
+    // Reject 160x128 parameter sets for the larger requested frame.
+    CHECK(PhxAVCEncode(testConnection, image, pts, duration, &second) == kVTVideoEncoderMalfunctionErr && !second);
+    CFRelease(image);
+    puts("Phoenix AVC adapter host tests passed (420v and 420f)");
     return 0;
 }

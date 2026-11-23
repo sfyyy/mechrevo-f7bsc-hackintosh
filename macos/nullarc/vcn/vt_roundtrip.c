@@ -9,20 +9,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef PHX_VT_ENCODER
-#include "phx_avc.h"
 #include "phx_vt.h"
-#endif
 
-enum { frameCount = 8, frameRate = 30 };
+enum { frameCount = 8, frameRate = 25 };
 static unsigned width = 320, height = 192;
-static const OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+static const OSType videoRange = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+static OSType inputFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 
 typedef struct {
     pthread_mutex_t lock;
     CMSampleBufferRef samples[frameCount];
     unsigned count;
     bool failed;
+    bool hasEncoderID;
 } Encoded;
 
 typedef struct {
@@ -68,9 +67,9 @@ static void encodedFrame(void *ref, void *source, OSStatus status, VTEncodeInfoF
     pthread_mutex_unlock(&out->lock);
 }
 
-static bool validNV12(CVImageBufferRef image) {
+static bool validNV12(CVImageBufferRef image, OSType format) {
     return image && CVPixelBufferGetWidth(image) == width && CVPixelBufferGetHeight(image) == height &&
-           CVPixelBufferGetPixelFormatType(image) == pixelFormat && CVPixelBufferGetPlaneCount(image) == 2 &&
+           CVPixelBufferGetPixelFormatType(image) == format && CVPixelBufferGetPlaneCount(image) == 2 &&
            CVPixelBufferGetIOSurface(image);
 }
 
@@ -80,7 +79,7 @@ static void decodedFrame(void *ref, void *source, OSStatus status, VTDecodeInfoF
     (void)duration;
     Decoded *out = ref;
     const int index = frameIndex(pts);
-    bool valid = status == noErr && !(flags & kVTDecodeInfo_FrameDropped) && index >= 0 && validNV12(image);
+    bool valid = status == noErr && !(flags & kVTDecodeInfo_FrameDropped) && index >= 0 && validNV12(image, videoRange);
     if (valid) {
         valid = CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess;
         if (valid) {
@@ -94,7 +93,7 @@ static void decodedFrame(void *ref, void *source, OSStatus status, VTDecodeInfoF
                 valid = abs((int)row[width / 4] - luma(index, false)) <= 20 &&
                         abs((int)row[width * 3 / 4] - luma(index, true)) <= 20;
                 for (unsigned half = 0; half < 2; ++half) {
-                    const uint8_t *pair = uv + ((2 * half + 1) * height / 8) * uvStride + width / 2;
+                    const uint8_t *pair = uv + ((2 * half + 1) * height / 8) * uvStride + ((width / 2) & ~1u);
                     valid = valid && abs(pair[0] - chroma(index, half, false)) <= 20 &&
                                      abs(pair[1] - chroma(index, half, true)) <= 20;
                 }
@@ -113,8 +112,8 @@ static void decodedFrame(void *ref, void *source, OSStatus status, VTDecodeInfoF
     pthread_mutex_unlock(&out->lock);
 }
 
-static CFDictionaryRef surfaceAttributes(void) {
-    int fmt = (int)pixelFormat;
+static CFDictionaryRef surfaceAttributes(OSType format) {
+    int fmt = (int)format;
     CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &fmt);
     CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
                                                   &kCFTypeDictionaryValueCallBacks);
@@ -171,13 +170,20 @@ static bool checkAcceleration(VTSessionRef session, CFStringRef key, bool requir
     return true;
 }
 
+// Build equivalent full-range input for the video-range levels checked after decoding.
+static uint8_t inputLevel(uint8_t limited, bool isChroma) {
+    if (inputFormat == videoRange) return limited;
+    unsigned span = isChroma ? 224 : 219;
+    return (uint8_t)(((limited - 16u) * 255u + span / 2) / span);
+}
+
 static OSStatus encodeFrame(VTCompressionSessionRef session, int index) {
     CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(session);
     CVPixelBufferRef pixel = NULL;
     CVReturn status = pool ? CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pixel) : kCVReturnInvalidArgument;
     if (status != kCVReturnSuccess)
         return status;
-    if (!validNV12(pixel)) {
+    if (!validNV12(pixel, inputFormat)) {
         CFRelease(pixel);
         return kCVReturnInvalidPixelFormat;
     }
@@ -188,14 +194,14 @@ static OSStatus encodeFrame(VTCompressionSessionRef session, int index) {
         const size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
         const size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
         for (size_t row = 0; row < height; ++row) {
-            memset(y + row * yStride, luma(index, false), width / 2);
-            memset(y + row * yStride + width / 2, luma(index, true), width / 2);
+            memset(y + row * yStride, inputLevel(luma(index, false), false), width / 2);
+            memset(y + row * yStride + width / 2, inputLevel(luma(index, true), false), width / 2);
         }
         for (unsigned row = 0; row < height / 2; ++row) {
             uint8_t *line = uv + row * uvStride;
             for (unsigned x = 0; x < width; x += 2) {
-                line[x] = chroma(index, row >= height / 4, false);
-                line[x + 1] = chroma(index, row >= height / 4, true);
+                line[x] = inputLevel(chroma(index, row >= height / 4, false), true);
+                line[x + 1] = inputLevel(chroma(index, row >= height / 4, true), true);
             }
         }
         CVPixelBufferUnlockBaseAddress(pixel, 0);
@@ -206,8 +212,16 @@ static OSStatus encodeFrame(VTCompressionSessionRef session, int index) {
     return status;
 }
 
+static void printEncoderID(const char *label, CFStringRef id) {
+    char text[512];
+    if (id && CFGetTypeID(id) == CFStringGetTypeID() &&
+        CFStringGetCString(id, text, sizeof(text), kCFStringEncodingUTF8)) {
+        printf("  %s: %s\n", label, text);
+    }
+}
+
 static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFStringRef encoderID,
-                   CFDictionaryRef attrs, Encoded *out) {
+                   CFStringRef expectedID, CFDictionaryRef attrs, Encoded *out) {
     CFDictionaryRef spec = sessionSpecification(true, hardware, gpu, encoderID);
     VTCompressionSessionRef session = NULL;
     OSStatus status = VTCompressionSessionCreate(NULL, width, height, codec, spec, attrs, NULL,
@@ -226,10 +240,16 @@ static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFStr
         status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
     const bool accelerated = status == noErr &&
         checkAcceleration(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, hardware);
-    if (status == noErr && encoderID) {
+    if (status == noErr) {
         CFTypeRef selected = NULL;
-        status = VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, NULL, &selected);
-        if (!status && (!selected || !CFEqual(selected, encoderID))) status = kVTCouldNotFindVideoEncoderErr;
+        OSStatus query = VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, NULL, &selected);
+        out->hasEncoderID = !query && selected && CFGetTypeID(selected) == CFStringGetTypeID() &&
+                            CFStringGetLength(selected) > 0;
+        if (out->hasEncoderID) printEncoderID("selected encoder ID", selected);
+        if (expectedID && (query || !selected || !CFEqual(selected, expectedID))) {
+            fputs("  unexpected encoder ID\n", stderr);
+            status = query ? query : kVTCouldNotFindVideoEncoderErr;
+        }
         if (selected) CFRelease(selected);
     }
     VTCompressionSessionInvalidate(session);
@@ -243,6 +263,11 @@ static bool encode(CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFStr
         const int index = frameIndex(CMSampleBufferGetPresentationTimeStamp(sample));
         if (!format || CMFormatDescriptionGetMediaSubType(format) != codec || index < 0 || (seen & (1u << index)))
             return false;
+        CGSize visible = CMVideoFormatDescriptionGetPresentationDimensions(format, false, true);
+        if (visible.width != width || visible.height != height) {
+            fprintf(stderr, "  compressed format displays at %gx%g, requested %ux%u\n", visible.width, visible.height, width, height);
+            return false;
+        }
         seen |= 1u << index;
     }
     return status == noErr && accelerated && !out->failed && out->count == frameCount;
@@ -286,62 +311,121 @@ static void releaseSamples(Encoded *out) {
     }
     out->count = 0;
     out->failed = false;
+    out->hasEncoderID = false;
 }
 
-static bool testCodec(const char *name, CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFDictionaryRef attrs) {
+static bool testCodec(const char *name, CMVideoCodecType codec, bool hardware, CFNumberRef gpu, CFDictionaryRef attrs,
+                      CFDictionaryRef decodedAttrs) {
     Encoded encoded = {.lock = PTHREAD_MUTEX_INITIALIZER};
     printf("%s hardware decode advertised: %s\n", name, VTIsHardwareDecodeSupported(codec) ? "yes" : "no");
     printf("%s %s encode\n", name, hardware ? "hardware" : "software");
-    const bool encodeOK = encode(codec, hardware, gpu, NULL, attrs, &encoded);
+    const bool encodeOK = encode(codec, hardware, gpu, NULL, NULL, attrs, &encoded);
     printf("  %s (%u/%d compressed frames)\n", encodeOK ? "PASS" : "FAIL", encoded.count, frameCount);
     bool haveInput = encodeOK;
     if (!haveInput && hardware) {
         releaseSamples(&encoded);
         printf("%s software encode for the hardware decoder's input\n", name);
-        haveInput = encode(codec, false, NULL, NULL, attrs, &encoded);
+        haveInput = encode(codec, false, NULL, NULL, NULL, attrs, &encoded);
     }
     printf("%s %s decode\n", name, hardware ? "hardware" : "software");
-    const bool decodeOK = haveInput && decode(&encoded, hardware, gpu, attrs);
+    const bool decodeOK = haveInput && decode(&encoded, hardware, gpu, decodedAttrs);
     printf("  %s\n", decodeOK ? "PASS" : (haveInput ? "FAIL" : "BLOCKED (no compressed sample)"));
     releaseSamples(&encoded);
     pthread_mutex_destroy(&encoded.lock);
     return encodeOK && decodeOK;
 }
 
+static bool listEncoders(CMVideoCodecType requestedCodec, CFStringRef expectedID) {
+    CFArrayRef encoders = NULL;
+    OSStatus status = VTCopyVideoEncoderList(NULL, &encoders);
+    bool found = false;
+    for (CFIndex i = 0; !status && encoders && i < CFArrayGetCount(encoders); ++i) {
+        CFDictionaryRef entry = CFArrayGetValueAtIndex(encoders, i);
+        CFTypeRef id = CFDictionaryGetValue(entry, kVTVideoEncoderList_EncoderID);
+        CFNumberRef codec = CFDictionaryGetValue(entry, kVTVideoEncoderList_CodecType);
+        int32_t type = 0;
+        if (!id || !codec || !CFNumberGetValue(codec, kCFNumberSInt32Type, &type) ||
+            (CMVideoCodecType)type != requestedCodec) continue;
+        printEncoderID("listed encoder ID", id);
+        if (!expectedID || CFEqual(id, expectedID)) found = true;
+    }
+    if (encoders) CFRelease(encoders);
+    printf("System encoder list: %s %s (status %d)\n", expectedID ? "Phoenix H.264" : "requested codec",
+           found ? "present" : "absent", (int)status);
+    return found;
+}
+
+static bool testHardwareEncoder(CMVideoCodecType codec, bool system, CFStringRef expectedID,
+                                CFDictionaryRef attrs, CFDictionaryRef decodedAttrs) {
+    bool listed = !system || listEncoders(codec, expectedID);
+    Encoded encoded = {.lock = PTHREAD_MUTEX_INITIALIZER};
+    bool ok = encode(codec, true, NULL, system ? NULL : expectedID, expectedID, attrs, &encoded);
+    if (ok && !encoded.hasEncoderID) {
+        fputs("  hardware session did not report an encoder ID\n", stderr);
+        ok = false;
+    }
+    const char *name = codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264";
+    printf("%s%s VT hardware encode: %s (%u/%d)\n", expectedID ? "Phoenix " : "", name,
+           ok ? "PASS" : "FAIL", encoded.count, frameCount);
+    if (ok) {
+        ok = decode(&encoded, false, NULL, decodedAttrs);
+        printf("Independent software decode and Y/UV check: %s\n", ok ? "PASS" : "FAIL");
+    }
+    releaseSamples(&encoded);
+    pthread_mutex_destroy(&encoded.lock);
+    return listed && ok;
+}
+
+static bool parseSize(const char *s) {
+    char *x, *end;
+    errno = 0;
+    unsigned long w = strtoul(s, &x, 10);
+    if (*s < '0' || *s > '9' || *x != 'x' || x[1] < '0' || x[1] > '9') return false;
+    unsigned long h = strtoul(x + 1, &end, 10);
+    if (errno || *end || w < 2 || h < 2 || w > INT32_MAX || h > INT32_MAX || ((w | h) & 1)) return false;
+    width = (unsigned)w;
+    height = (unsigned)h;
+    return true;
+}
+
 int main(int argc, char **argv) {
-    bool hardware = true;
+    bool hardware = true, system = false, local = false;
+    CMVideoCodecType systemCodec = 0;
     CFNumberRef gpu = NULL;
+    int arg = 1;
+    if (arg + 1 < argc && strcmp(argv[arg], "--system-encode") == 0) {
+        const char *codec = argv[arg + 1];
+        if (strcmp(codec, "h264") == 0) systemCodec = kCMVideoCodecType_H264;
+        else if (strcmp(codec, "hevc") == 0) systemCodec = kCMVideoCodecType_HEVC;
+        else {
+            fputs("--system-encode accepts h264 or hevc\n", stderr);
+            return 2;
+        }
+        arg += 2;
+    } else if (arg < argc && strcmp(argv[arg], "--system-phx") == 0) {
+        system = true;
+        width = 2048;
+        height = 1152;
+        inputFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        ++arg;
+    }
 #ifdef PHX_VT_ENCODER
-    if (argc == 2 && strcmp(argv[1], "--phx-avc") == 0) {
-        OSStatus status = PhxRegisterAVCEncoder();
-        if (status) {
-            fprintf(stderr, "Phoenix encoder registration: %d\n", (int)status);
-            return 1;
-        }
-        width = PhxAVCWidth;
-        height = PhxAVCHeight;
-        CFDictionaryRef attrs = surfaceAttributes();
-        Encoded encoded = {.lock = PTHREAD_MUTEX_INITIALIZER};
-        bool ok = encode(kCMVideoCodecType_H264, true, NULL, PhxAVCEncoderID, attrs, &encoded);
-        printf("Phoenix H.264 VT hardware encode: %s (%u/%d)\n", ok ? "PASS" : "FAIL", encoded.count, frameCount);
-        if (ok) {
-            ok = decode(&encoded, false, NULL, attrs);
-            printf("Independent software decode and Y/UV check: %s\n", ok ? "PASS" : "FAIL");
-        }
-        releaseSamples(&encoded);
-        pthread_mutex_destroy(&encoded.lock);
-        CFRelease(attrs);
-        return ok ? 0 : 1;
+    else if (arg < argc && strcmp(argv[arg], "--phx-avc") == 0) {
+        local = true;
+        width = 160;
+        height = 128;
+        ++arg;
     }
 #endif
-    if (argc == 2 && strcmp(argv[1], "--software") == 0) {
+    else if (arg < argc && strcmp(argv[arg], "--software") == 0) {
         hardware = false;
-    } else if (argc == 3 && strcmp(argv[1], "--gpu-id") == 0) {
-        char *end = NULL;
+        ++arg;
+    } else if (arg + 1 < argc && strcmp(argv[arg], "--gpu-id") == 0) {
+        const char *idString = argv[++arg];
+        char *end;
         errno = 0;
-        unsigned long long value = strtoull(argv[2], &end, 0);
-        if (!errno && end != argv[2] && !*end && *argv[2] >= '0' && *argv[2] <= '9' &&
-            value > 0 && value <= INT64_MAX) {
+        unsigned long long value = strtoull(idString, &end, 0);
+        if (!errno && *idString >= '0' && *idString <= '9' && !*end && value > 0 && value <= INT64_MAX) {
             int64_t id = (int64_t)value;
             gpu = CFNumberCreate(NULL, kCFNumberSInt64Type, &id);
         }
@@ -349,16 +433,47 @@ int main(int argc, char **argv) {
             fputs("invalid GPU registry ID\n", stderr);
             return 2;
         }
-    } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--software | --gpu-id ID]\n", argv[0]);
+        ++arg;
+    }
+    if (arg + 1 < argc && strcmp(argv[arg], "--size") == 0 && parseSize(argv[arg + 1])) arg += 2;
+    if (arg < argc && strcmp(argv[arg], "--full-range") == 0) {
+        inputFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        ++arg;
+    }
+    if (arg != argc) {
+        fprintf(stderr, "usage: %s [--software | --gpu-id ID | --system-encode h264|hevc | --system-phx"
+#ifdef PHX_VT_ENCODER
+                " | --phx-avc"
+#endif
+                "] [--size WIDTHxHEIGHT] [--full-range]\n", argv[0]);
+        if (gpu) CFRelease(gpu);
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
-    CFDictionaryRef attrs = surfaceAttributes();
-    const bool avc = testCodec("H.264", kCMVideoCodecType_H264, hardware, gpu, attrs);
-    const bool hevc = testCodec("HEVC", kCMVideoCodecType_HEVC, hardware, gpu, attrs);
+#ifdef PHX_VT_ENCODER
+    if (local) {
+        OSStatus status = PhxRegisterAVCEncoder();
+        if (status) {
+            fprintf(stderr, "Phoenix encoder registration: %d\n", (int)status);
+            return 1;
+        }
+    }
+#endif
+    printf("Input: %ux%u %s at %d fps\n", width, height, inputFormat == videoRange ? "420v" : "420f", frameRate);
+    CFDictionaryRef attrs = surfaceAttributes(inputFormat);
+    CFDictionaryRef decodedAttrs = surfaceAttributes(videoRange);
+    bool ok;
+    if (systemCodec) {
+        ok = testHardwareEncoder(systemCodec, true, NULL, attrs, decodedAttrs);
+    } else if (system || local) {
+        ok = testHardwareEncoder(kCMVideoCodecType_H264, system, PhxAVCEncoderID, attrs, decodedAttrs);
+    } else {
+        bool avc = testCodec("H.264", kCMVideoCodecType_H264, hardware, gpu, attrs, decodedAttrs);
+        bool hevc = testCodec("HEVC", kCMVideoCodecType_HEVC, hardware, gpu, attrs, decodedAttrs);
+        ok = avc && hevc;
+    }
     CFRelease(attrs);
-    if (gpu)
-        CFRelease(gpu);
-    return avc && hevc ? 0 : 1;
+    CFRelease(decodedAttrs);
+    if (gpu) CFRelease(gpu);
+    return ok ? 0 : 1;
 }

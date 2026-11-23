@@ -1,5 +1,4 @@
 #include "phx_avc_io.h"
-#include "PhxVcnUserABI.h"
 #include <VideoToolbox/VTErrors.h>
 
 // PhxBringup's native client handshake is shared with the graphics driver.
@@ -11,6 +10,8 @@ _Static_assert(PhxAVCWidth == PHXN_VCN_WIDTH && PhxAVCHeight == PHXN_VCN_HEIGHT 
 static OSStatus ioStatus(kern_return_t kr) {
     switch (kr) {
     case KERN_SUCCESS: return noErr;
+    case kIOReturnBadArgument: return kVTParameterErr;
+    case kIOReturnUnsupported: return kVTVideoEncoderNotAvailableNowErr;
     case kIOReturnNotPrivileged:
     case kIOReturnNotPermitted: return kVTVideoEncoderAuthorizationErr;
     case kIOReturnNoMemory: return kVTAllocationFailedErr;
@@ -22,9 +23,10 @@ static OSStatus ioStatus(kern_return_t kr) {
     }
 }
 
-OSStatus PhxAVCOpen(io_connect_t *connection) {
+OSStatus PhxAVCOpenForDimensions(CMVideoDimensions dimensions, io_connect_t *connection) {
     if (!connection) return kVTParameterErr;
     *connection = IO_OBJECT_NULL;
+    if (!phxnVcnSizeSupported(dimensions.width, dimensions.height)) return kVTParameterErr;
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
     if (!service) return kVTCouldNotFindVideoEncoderErr;
     io_connect_t client = IO_OBJECT_NULL;
@@ -38,6 +40,9 @@ OSStatus PhxAVCOpen(io_connect_t *connection) {
     OSStatus status = ioStatus(kr);
     if (!status && (count != 4 || reply[0] != abiVersion || reply[1] < PHXN_VCN_MIN_BUILD))
         status = kVTCouldNotFindVideoEncoderErr;
+    if (!status && reply[1] < PHXN_VCN_SIZED_MIN_BUILD &&
+        (dimensions.width != PhxAVCWidth || dimensions.height != PhxAVCHeight))
+        status = kVTParameterErr;
     if (!status) {
         uint64_t ready = 0;
         count = 1;
@@ -50,7 +55,16 @@ OSStatus PhxAVCOpen(io_connect_t *connection) {
     return status;
 }
 
-OSStatus PhxAVCSubmit(io_connect_t connection, const uint8_t *nv12, uint8_t *annexB, size_t *bytes) {
-    return ioStatus(IOConnectCallStructMethod(connection, PHXN_SEL_VCN_ENCODE_H264,
-                                              nv12, PHXN_VCN_NV12_BYTES, annexB, bytes));
+OSStatus PhxAVCOpen(io_connect_t *connection) {
+    return PhxAVCOpenForDimensions((CMVideoDimensions){PhxAVCWidth, PhxAVCHeight}, connection);
+}
+
+OSStatus PhxAVCSubmit(io_connect_t connection, uint32_t width, uint32_t height,
+                      const uint8_t *nv12, uint8_t *annexB, size_t *bytes) {
+    if (width == PHXN_VCN_WIDTH && height == PHXN_VCN_HEIGHT)
+        return ioStatus(IOConnectCallStructMethod(connection, PHXN_SEL_VCN_ENCODE_H264,
+                                                  nv12, PHXN_VCN_NV12_BYTES, annexB, bytes));
+    const uint64_t dimensions[] = {width, height};
+    return ioStatus(IOConnectCallMethod(connection, PHXN_SEL_VCN_ENCODE_H264_SIZED, dimensions, 2,
+                                        nv12, phxnVcnPackedBytes(width, height), NULL, NULL, annexB, bytes));
 }

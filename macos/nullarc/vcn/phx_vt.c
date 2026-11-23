@@ -13,6 +13,7 @@
 typedef struct {
     io_connect_t connection;
     void *session;
+    CMVideoDimensions dimensions;
 } Encoder;
 
 #pragma pack(push, 4)
@@ -112,22 +113,26 @@ static OSStatus copySupportedProperties(CFTypeRef object, CFDictionaryRef *out) 
 }
 
 static OSStatus start(CFTypeRef object, void *session, CMVideoDimensions dimensions) {
-    if (dimensions.width != PhxAVCWidth || dimensions.height != PhxAVCHeight)
-        return kVTParameterErr;
     Encoder *encoder = CMBaseObjectGetDerivedStorage(object);
     if (encoder->session) return kVTInvalidSessionErr;
-    int32_t format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &format);
-    if (!number) return kVTAllocationFailedErr;
-    const void *key = kCVPixelBufferPixelFormatTypeKey;
-    const void *value = number;
+    const int32_t formats[] = {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                               kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
+    CFNumberRef video = CFNumberCreate(NULL, kCFNumberSInt32Type, &formats[0]);
+    CFNumberRef full = CFNumberCreate(NULL, kCFNumberSInt32Type, &formats[1]);
+    const void *numbers[] = {video, full};
+    CFArrayRef supported = video && full ? CFArrayCreate(NULL, numbers, 2, &kCFTypeArrayCallBacks) : NULL;
+    if (video) CFRelease(video);
+    if (full) CFRelease(full);
+    if (!supported) return kVTAllocationFailedErr;
+    const void *key = kCVPixelBufferPixelFormatTypeKey, *value = supported;
     CFDictionaryRef attrs = CFDictionaryCreate(NULL, &key, &value, 1,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFRelease(number);
+    CFRelease(supported);
     if (!attrs) return kVTAllocationFailedErr;
-    OSStatus status = PhxAVCOpen(&encoder->connection);
+    OSStatus status = PhxAVCOpenForDimensions(dimensions, &encoder->connection);
     if (status == noErr) {
         encoder->session = session;
+        encoder->dimensions = dimensions;
         VTEncoderSessionSetPixelBufferAttributes(session, attrs);
     }
     CFRelease(attrs);
@@ -140,6 +145,8 @@ static OSStatus encode(CFTypeRef object, void *sourceFrame, CVPixelBufferRef pix
     Encoder *encoder = CMBaseObjectGetDerivedStorage(object);
     if (!encoder->session) return kVTInvalidSessionErr;
     if (flags) *flags = 0;
+    if (!pixel || CVPixelBufferGetWidth(pixel) != (size_t)encoder->dimensions.width ||
+        CVPixelBufferGetHeight(pixel) != (size_t)encoder->dimensions.height) return kVTParameterErr;
     CMSampleBufferRef sample = NULL;
     OSStatus status = PhxAVCEncode(encoder->connection, pixel, pts, duration, &sample);
     if (status == noErr) {
@@ -174,7 +181,8 @@ static const struct {
 };
 static const EncoderTable encoderTable = {NULL, &baseStorage.base, &classStorage.encoder};
 
-static OSStatus createEncoder(CMVideoCodecType codec, CFAllocatorRef allocator, CFTypeRef *result) {
+// CoreMedia resolves this factory by name from the installed bundle's Info.plist.
+OSStatus PhxAVCEncoderCreate(CMVideoCodecType codec, CFAllocatorRef allocator, CFTypeRef *result) {
     *result = NULL;
     if (codec != kCMVideoCodecType_H264) return kVTCouldNotFindVideoEncoderErr;
     return CMDerivedObjectCreate(allocator, &encoderTable, VTVideoEncoderGetClassID(), result);
@@ -191,7 +199,7 @@ OSStatus PhxRegisterAVCEncoder(void) {
         status = PhxAVCOpen(&probe);
         if (status == noErr) {
             IOServiceClose(probe);
-            // Keep this size-limited encoder behind codecs that handle general AVC.
+            // In-process callers explicitly request the encoder ID.
             int32_t priority = -100;
             CFNumberRef rating = CFNumberCreate(NULL, kCFNumberSInt32Type, &priority);
             const void *keys[] = {CFSTR("CMClassImplementationID"), kVTVideoEncoder_EncoderNameKey,
@@ -199,7 +207,7 @@ OSStatus PhxRegisterAVCEncoder(void) {
             const void *values[] = {PhxAVCEncoderID, CFSTR("Phoenix VCN H.264"), kCFBooleanTrue, rating};
             CFDictionaryRef info = rating ? CFDictionaryCreate(NULL, keys, values, 4,
                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
-            status = info ? VTRegisterVideoEncoderWithInfo(kCMVideoCodecType_H264, info, createEncoder)
+            status = info ? VTRegisterVideoEncoderWithInfo(kCMVideoCodecType_H264, info, PhxAVCEncoderCreate)
                           : kVTAllocationFailedErr;
             if (info) CFRelease(info);
             if (rating) CFRelease(rating);

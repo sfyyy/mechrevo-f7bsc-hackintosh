@@ -2,36 +2,63 @@
 
 2026-11-22，本机重启加载 PhxBringup build 64 后，普通用户通过 VideoToolbox 的 Phoenix 编码器完成了八帧 160×128 H.264 硬编码。独立软件解码器按时间戳逐帧核对了各帧特有的亮度和色度图案。驱动诊断还通过了 864×480 H.264 固定帧硬解和 136 字节 IDR 的正常导出。初始化和底层诊断使用 selector 120，需要 root 和启动参数 `phxdebug=1`。[真机记录](NEXT.md)
 
-build 64 增加了应用提交 NV12 帧的接口。驱动源码与参考向量见 [build 64 补丁](../patches/phxbringup-vcn.patch)。VideoToolbox 进程内编码器与验收程序位于本目录。
+build 65 在 build 64 的固定帧接口之外增加了按会话尺寸提交 NV12 的接口。驱动源码与参考向量见 [PhxBringup 补丁](../patches/phxbringup-vcn.patch)。
 
 ## 应用接入 H.264 编码
 
 在 x86_64 应用中一同编译 `phx_vt.c`、`phx_avc.c` 和 `phx_avc_io.c`。启动时调用 `PhxRegisterAVCEncoder()`，成功后使用 `VTCompressionSessionCreate` 创建 H.264 会话。编码器说明字典中将 `kVTVideoEncoderSpecification_EncoderID` 设为 `PhxAVCEncoderID`，将 `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` 设为 `kCFBooleanTrue`。可运行示例见 [vt_roundtrip.c](vt_roundtrip.c) 的 `--phx-avc` 入口。
 
-输入为 160×128 的视频范围 NV12。每帧生成一张独立 IDR，回调返回带输入时间戳和时长的 AVC 样本。每个使用该编码器的进程都需要注册。注册使用了 macOS 私有接口，目前只在 x86_64 macOS 26.7.1 验证过。HEVC、应用硬解码、其他分辨率以及第三方应用的系统级发现仍待实现。
+客户端按原尺寸提交双平面 NV12（`420v` 或 `420f`）。适配层会把全范围输入映射到码流使用的视频范围。build 64 支持 160×128。build 65 接受两边均为偶数、每边至少 128、长边最多 2560、短边最多 1440 的尺寸，包含 960×540、1920×1080、2048×1152 和 2560×1440。每帧生成一张独立 IDR，回调返回带输入时间戳和时长的 H.264 样本。当前提供器使用 x86_64 macOS 26 的私有插件 ABI。HEVC 硬编码、应用硬解码和会议吞吐量尚未验收。
 
-本机工作目录的 `vcntest/phx-vt-roundtrip` 已编译，可在重启后直接运行。也可在本目录重新编译：
+以下命令从本目录构建进程内注册的验收程序。
 
-    clang -std=c11 -O2 -Wall -Wextra -Werror -DPHX_VT_ENCODER \
+    clang -std=c11 -O2 -Wall -Wextra -Werror -Wl,-adhoc_codesign -DPHX_VT_ENCODER \
         vt_roundtrip.c phx_vt.c phx_avc.c phx_avc_io.c \
         -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
         -framework CoreFoundation -framework IOKit -o /tmp/phx-vt-roundtrip
 
-在工作目录运行 `sudo bash install-vcn.sh` 部署 build 64。重启后确认 `phx-build` 为 64，再运行以下命令。初始化使用现有的 root 诊断入口，随后以普通用户运行应用。休眠后需要重新初始化。
+在工作目录运行 `sudo bash install-vcn.sh` 部署本地候选 kext。重启后确认 `phx-build` 为 65，再运行以下命令。初始化使用现有的 root 诊断入口，随后以普通用户运行应用。休眠后需要重新初始化。
 
     ioreg -r -c PhxBringup -d 1 | grep phx-build
     sudo bash vcn-test.sh --keep
     /tmp/phx-vt-roundtrip --phx-avc
+    /tmp/phx-vt-roundtrip --phx-avc --size 2048x1152 --full-range
+    /tmp/phx-vt-roundtrip --phx-avc --size 2560x1440 --full-range
     sudo /Users/Shared/gpu/vcnctl down
 
 验收程序检查会话实际选择的编码器 ID 和硬件属性，再将八帧编码结果交给独立软件解码器，检查时间戳、亮度和 UV。build 64 真机运行输出 `Phoenix H.264 VT hardware encode: PASS (8/8)` 和 `Independent software decode and Y/UV check: PASS`，退出码为 0。
 
 开发时可用参考码流验证 VideoToolbox 回调。在本目录运行以下命令。测试替换了 IOKit 后端，保留真实 VideoToolbox 会话。
 
-    clang -std=c11 -O2 -Wall -Wextra -Werror phx_vt_test.c phx_vt.c phx_avc.c \
+    clang -std=c11 -O2 -Wall -Wextra -Werror -Wl,-adhoc_codesign phx_vt_test.c phx_vt.c phx_avc.c \
         -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
         -framework CoreFoundation -framework IOKit -o /tmp/phx-vt-test
     /tmp/phx-vt-test vcn_quadrants.h264
+    /tmp/phx-vt-test fixture-2048x1152.h264 2048 1152
+    /tmp/phx-vt-test fixture-2560x1440.h264 2560 1440
+
+两份会议尺寸的参考文件各含一帧由系统软件 H.264 编码器生成的测试图案。上述回放用例以 1/25 秒为间隔提交时间戳，并核对八次回调中的画幅、时间戳和帧时长。持续编码帧率需要在硬件上另行测量。
+
+## 系统发现与会议尺寸验收
+
+**本机 macOS 26.7.1 的默认编码器列表仍不包含 Phoenix。** 用 [构建脚本](build-vt-bundle.sh) 生成插件，安装到 `/Library/Video/Plug-Ins` 后在独立进程中测试，CoreMedia 的系统扫描会过滤其签名。Apple 自带的 H.264 插件通过了同一签名检查。普通 Developer ID 也无法让 `org.nullarc.phoenix.avc` 满足这项要求。build 65 的尺寸支持可以通过上面的进程内会话单独验收。
+
+腾讯会议在本机共享屏幕时记录了 2048×1152 和 2560×1440 的 r264 编码，屏幕采集为 25 fps 的全范围 NV12。部分 2560×1440 会话选择了 v265 软件 HEVC。以下独立程序只链接 Apple 框架，可检查普通应用首次打开 VideoToolbox 时的结果。
+
+    clang -std=c11 -O2 -Wall -Wextra -Werror -Wl,-adhoc_codesign vt_roundtrip.c \
+        -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+        -framework CoreFoundation -o /tmp/phx-vt-system
+    /tmp/phx-vt-system --system-phx --size 2048x1152
+    /tmp/phx-vt-system --system-phx --size 2560x1440
+
+要复现原版应用按编码格式自动选择硬件的行为，运行下面两项。每项都列出该格式的系统候选，直接要求硬件编码，成功时打印实际编码器 ID 并独立解码。它们也能验收 Apple GVA 命名的编码器。
+
+    /tmp/phx-vt-system --system-encode h264 --size 160x128
+    /tmp/phx-vt-system --system-encode hevc --size 1920x1080
+
+本机的原版 FFmpeg 对照、GVA 注册入口和 AMD 驱动对 Phoenix 设备 ID 的检查见[系统接口实测](NEXT.md)。
+
+`--system-phx` 查询系统编码器列表，再以 H.264 和“要求硬件”的选项创建会话。通过要求为系统列出 Phoenix、自动选中 Phoenix 的编码器 ID、硬件标志为真，并且独立软件解码得到原尺寸、时间戳及每帧特有的 Y/UV 图案。测试输入为 8 帧 `420f`，时间戳间隔为 1/25 秒。软件对照可用 `--software --size 2048x1152 --full-range`。[本机测试记录](NEXT.md)
 
 ## 从原版源码复现
 
@@ -61,7 +88,7 @@ vcn_quadrants.h264 来自 macOS 软件 AVC 编码器，输入为 160×128、Y=48
 重启进入 macOS 后，在工作目录执行：
 
     ioreg -r -c PhxBringup -d 1 | grep phx-build
-    # 测试应用接口时确认已加载 64
+    # 测试多分辨率应用接口时确认已加载 65
     sudo bash vcn-test.sh
 
 脚本验证固件、四个 END、跨回绕 fence、两种会话，再分别运行 decode-frame 和 encode-frame。解码目标为 864×480 NV12，行跨度 1024，对完整 737280 字节求和应为 0x020345d8。编码目标为 160×128 的单张 IDR 图，独立软件解码器核验四个象限的亮度和中性色度。每次运行在 /Users/Shared/gpu/vcn-run.XXXXXXXX 留存 run.log 和已通过驱动校验的 frame.nv12、frame.h264。失败时另存 crumbs.log。脚本会启动四分钟重启 watchdog，结束时撤销。测试成功可用 --keep 保持 VCN 上电。

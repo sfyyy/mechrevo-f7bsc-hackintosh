@@ -1,5 +1,31 @@
 # Radeon 780M VCN 4.0.2 真机结果
 
+## 普通应用如何发现编码器 · macOS 26.7.1（25G241），x86_64
+
+原版 FFmpeg 8.0.1 以 4 Mb/s 请求 VideoToolbox 硬编码。160×128 的 H.264 和 1920×1080 的 HEVC 均在创建会话时返回 `-12908`，没有输出帧。同一可执行文件强制软件编码时，两项各输出 8 帧。复测使用生成的 NV12 图案和一个 1080p 测试 MP4。本次 PhxBringup 为 build 64，`vcnctl status` 报告 down。主动注册 Phoenix 的旧测试返回 `-12915`，VCN 上电时的历史结果见下文。
+
+| 接口 | 在这台机器上的观察 |
+|---|---|
+| 系统 H.264 注册 | VideoToolbox 在 IOService 树查找 `IOGVACodec`，据此注册 `com.apple.videotoolbox.videoencoder.h264.gva`。工厂调用 AppleGVA 的 `AVFQTXENC_CreateMediaAcceleratorInterface`。AppleGVA 读取 `IODVDBundleName` 和 `IOVARendererID` 来选取 VA 驱动。本机在这三个键上的查询均无匹配。 |
+| 系统 HEVC 注册 | AppleGVAHEVCEncoder.bundle 的 `CMDependencies` 要求 `IOGVAHEVCEncode`，`VTIORegistryCapabilitiesKey` 指向 `IOGVAHEVCEncodeCapabilities`。这两个键在本机也没有匹配。 |
+| 系统 AMD 驱动 | AMDRadeonVADriver2 的 x86_64h 镜像 UUID 为 `8D3BA61E-7BC7-3BDF-ADB3-A7866360B6DE`。反汇编显示 `AVD_CreateAVDAccelerator` 创建 IOAccel 视频上下文后，由 `VAAcceleratorInfo::identify` 从该连接查询设备信息。该版本将 Phoenix 的真实 PCI 设备 ID `0x15bf` 归入不支持分支。其 VCN 编码器工厂只构造 VCN 2、3 的实现。此处为静态分析，原版 FFmpeg 的会话在发现阶段已经失败。 |
+| Phoenix 驱动 | Metal 能识别 780M，对应 IOService 为 `NMXAccel`。当前 `NVVideoContext` 沿用 `IOAccelVideoContext2` 基类，系统 AMD VA 驱动通过视频上下文提交缓冲区。现有 Phoenix H.264 提供器直接打开 `PhxBringup`，通过 selector 31 或 33 提交 NV12 图像。两条路径之间尚无适配实现。现有用户客户端也未提供 HEVC 编码。 |
+
+让原版应用实际出帧，需要系统能加载的 VA 后端接收系统的视频上下文、IOSurface 与完成通知，并调用 Phoenix 的 VCN 4.0.2 编码实现。单独发布发现属性无法让现有 AMD 驱动接受 Phoenix。普通应用验收从全新进程创建硬件会话，记录实际编码器 ID，并用独立软件解码器检查每帧的 Y/UV 图案。
+
+## 会议分辨率与系统枚举 · 2026-11-22
+
+本机腾讯会议的 `xcast_2026112205.log` 记录了 `r264encoder` 的全范围 2048×1152 输入和 `actual encode res 2048x1152`。11 月 20 日的日志也记录了 r264 的全范围 2560×1440 输入和 v265 的 2560×1440 输出。客户端同时记录 `no hw h264 encoder ablity`。
+
+| 检查 | 结果 |
+|---|---|
+| 单独编译的应用，仅调用系统 VideoToolbox | 在当前 build 64 上，2048×1152 和 2560×1440 的查询都成功返回列表，列表中没有 Phoenix。要求 H.264 硬编码的会话创建均返回 `-12908`。 |
+| 临时安装 PhoenixAVC.bundle 后重新启动独立验收进程 | 默认列表仍无 Phoenix。CoreFoundation 能读取插件及编码器工厂，插件通过自身 ad-hoc 签名校验。CoreMedia 系统扫描应用 `kFigRegistryAppleCodeSignRequirement` 时，Phoenix 校验失败，AppleH264SW.bundle 校验通过。检查完成后已移除测试安装。 |
+| Phoenix 用户态编码器与回放的硬件响应 | 160×128 及 960×540、1920×1080、2048×1152、2560×1440 会话每档均通过 8 帧回调验证。四个会议尺寸的输入为 `420f`，参考 IDR 来自独立软件编码器。另以有行填充的输入逐字节校验了全范围到视频范围的转换。 |
+| 系统软件编解码对照 | 2048×1152、2560×1440 的 `420f` 输入均通过 8 帧 H.264 和 HEVC 往返核验。 |
+| build 65 的固件参数 | 主机测试检查了步幅、缓冲区边界和参数包。CoreMedia 独立解析了 7 组 SPS/PPS，包含带宏块裁剪的 962×542 和 1920×1080，以及 2048×1152 和 2560×1440。 |
+| 已加载驱动的重复初始化 | build 64 在先前下电后，本次两次初始化均在等待首个 fence 时返回 code 14。清理后 `vcnctl status` 报告 down。build 65 的会议尺寸仍待上机取得实际 VCN 输出。 |
+
 ## build 64 · 2026-11-22
 
 重启后 IORegistry 报告 `phx-build = 64`。已加载的 PhxBringup 可执行文件与仓库 EFI 二进制的 Mach-O UUID 均为 `3F78DC1A-721E-35EB-AFBE-62C9DC7D7D1F`。测试开始时 VCN 已下电，随后使用 `vcn-test.sh --keep` 初始化并保持上电，应用测试以普通用户运行。

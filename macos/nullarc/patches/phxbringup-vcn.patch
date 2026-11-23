@@ -1,5 +1,5 @@
 diff --git a/src/phxbringup/PhxBringup.cpp b/src/phxbringup/PhxBringup.cpp
-index c863164..d701d59 100644
+index c863164..f06f707 100644
 --- a/src/phxbringup/PhxBringup.cpp
 +++ b/src/phxbringup/PhxBringup.cpp
 @@ -15,6 +15,7 @@
@@ -10,7 +10,7 @@ index c863164..d701d59 100644
  #include <IOKit/pci/IOPCIDevice.h>
  #include <libkern/OSAtomic.h>
  #include <pexpert/pexpert.h>
-@@ -23,8 +24,16 @@
+@@ -23,8 +24,17 @@
  #include <kern/clock.h>
  
  #include "PhxNativeABI.h"
@@ -20,15 +20,16 @@ index c863164..d701d59 100644
 +#include "PhxVcnEncode.h"
 +#include "PhxVcnEncodeFrame.h"
 +#include "../phxaccel/nvrm_vram_abi.h"
++#include "../phxaccel/PhxVideoAVC.h"
  
 -#define PHX_KEXT_BUILD 34u
 +using namespace phx_vcn;   // hard-coded VCN 4.0.2 constants (PhxVcn.h); the k* names below are all VCN's
 +
-+#define PHX_KEXT_BUILD 64u
++#define PHX_KEXT_BUILD 67u
  
  // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
  // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
-@@ -68,9 +77,12 @@ static constexpr uint32_t kGcVersion = (11u << 16) | (0u << 8) | 1u;
+@@ -68,9 +78,12 @@ static constexpr uint32_t kGcVersion = (11u << 16) | (0u << 8) | 1u;
  // Pools reported to RADV. E1 backs every BO with system memory, so these are budgets, not hardware:
  // BAR0 is 256 MiB on this machine, the UMA carve-out 6 GiB.
  static constexpr uint64_t kVisTotal = 256ull << 20;
@@ -44,7 +45,17 @@ index c863164..d701d59 100644
  static constexpr uint64_t kHostCap = 4096ull << 20, kHostMaxBo = 1024ull << 20;   // host imports, per client
  static constexpr uint64_t kVaMask = (1ull << 48) - 1;
  static constexpr int kMaxMaps = 4096;
-@@ -117,8 +129,23 @@ public:
+@@ -85,6 +98,9 @@ class PhxBringup : public IOService {
+ public:
+     bool start(IOService *provider) override;
+     void stop(IOService *provider) override;
++    void free() override;
++    IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2,
++                                  void *p3, void *p4) override;
+     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override;
+ 
+     bool claimSession();
+@@ -117,8 +133,25 @@ public:
      uint64_t gpuRetired() const;
      const phx_topology *capturedTopology() const { return topology; }
      IOReturn setPowerState(unsigned long ordinal, IOService *whichDevice) override;
@@ -58,17 +69,19 @@ index c863164..d701d59 100644
 +    IOReturn vcnFenceTest(uint64_t out[8]);
 +    IOReturn vcnCodecSessionTest(bool encode, uint64_t out[8]);
 +    IOReturn vcnCodecFrame(bool encode, uint8_t *output, uint32_t capacity, uint64_t out[8],
-+                           const uint8_t *packedNv12 = nullptr);
++                           const uint8_t *packedNv12 = nullptr, const EncodeGeometry &geometry = {});
 +    bool vcnEncoderReady() const;
 +    IOReturn vcnShutdown(uint64_t out[8]);
 +    IOReturn vcnLoadToc(uint32_t fwOff, uint32_t size, uint64_t out[8]);
  
  private:
 +    friend class IOAccelPhxNativeClient;
++    IOReturn encodeH264Descriptors(IOMemoryDescriptor *input, IOMemoryDescriptor *output,
++                                   const EncodeGeometry &geometry, uint32_t *bytesWritten);
      uint32_t rreg(uint32_t reg) const;
      void wreg(uint32_t reg, uint32_t value) const;
      uint32_t smuPoll() const;
-@@ -178,7 +205,7 @@ private:
+@@ -178,7 +211,7 @@ private:
      // A context's page tables, in physically contiguous 64 KiB chunks allocated as it maps (most contexts need one or
      // two): a single 4 MiB contiguous pool per context failed once memory was fragmented. Table i is page i % 16 of
      // chunk i / 16; table 0 is the root.
@@ -77,15 +90,17 @@ index c863164..d701d59 100644
      struct VmCtx {
          IOBufferMemoryDescriptor *chunk[kPtChunks];
          uint64_t chunkPhys[kPtChunks];
-@@ -210,6 +237,70 @@ private:
+@@ -210,6 +243,73 @@ private:
      bool debug{false};
      bool smuUsed{false};
      volatile SInt32 sessionOpen{0};
 +
 +    // --- VCN (hard-coded Phoenix VCN 4.0.2) -------------------------------------------------------------------
 +    IOLock *vcnLock{nullptr};
++    bool vcnStopped{false};  // guarded by vcnLock, which lives through the last retained video context
 +    bool vcnReady{false};
 +    bool vcnNeedsPowerDown{false};
++    bool vcnDpgActive{false};     // Hardware PG_MODE stays set after the init options have been cleared.
 +    uint64_t vcnFwMc{0};          // TMR MC address the PSP placed the firmware at (LOAD_IP_FW response)
 +    uint32_t vcnRingWptr{0};
 +    uint32_t vcnDbIndex{kDbIndexLinux};  // DWORD index in BAR2
@@ -108,6 +123,7 @@ index c863164..d701d59 100644
 +    uint32_t vcnIb[512]{};        // fixed VCN frame IB scratch, protected by vcnLock
 +    uint32_t vcnPowerUp(uint32_t ucodeSize, uint64_t out[8]);   // SMU power-up + registers (vcnLock held)
 +    bool vcnPowerDown(uint32_t *response);
++    bool vcnStopDpg();
 +    IOReturn vcnSetDoorbell(uint32_t index);
 +    bool vcnConfigureDoorbell(uint64_t out[8]);
 +    uint32_t vcnStaticStart(uint32_t ucodeSize);
@@ -138,7 +154,7 @@ index c863164..d701d59 100644
 +                           uint32_t *before, uint32_t *after, uint32_t *observed, uint32_t timeoutMs = 1000u);
 +    void vcnRecord(uint64_t out[8]) const;
 +    bool vcnRegOk(uint32_t reg) const;
-+    bool vcnFrameMemoryOk(bool encode) const;
++    bool vcnFrameMemoryOk(uint32_t scratchBytes) const;
 +    bool vcnWaitReg(uint32_t reg, uint32_t mask, uint32_t value, uint32_t timeoutMs) const;
 +    uint64_t vcnMc(uint32_t off) const { return fbMcBase + off; }
 +    uint32_t vcnReadVram(uint32_t off) const;
@@ -148,54 +164,65 @@ index c863164..d701d59 100644
  };
  
  OSDefineMetaClassAndStructors(PhxBringup, IOService)
-@@ -268,6 +359,8 @@ private:
+@@ -268,6 +368,8 @@ private:
      IOReturn doDbgSysMem(IOExternalMethodArguments *a);
      IOReturn doDbgAdoptQueue(IOExternalMethodArguments *a);
      IOReturn doDbgClaim(IOExternalMethodArguments *a);
 +    IOReturn doDbgVcn(IOExternalMethodArguments *a);
-+    IOReturn doEncodeH264(IOExternalMethodArguments *a);
++    IOReturn doEncodeH264(IOExternalMethodArguments *a, bool sized);
      void flushBos();
      Bo *findBo(uint32_t h);
      bool ibCovered(uint64_t vaCanon, uint64_t bytes);
-@@ -342,6 +435,7 @@ bool PhxBringup::start(IOService *provider) {
-     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
-     smuLock = IOLockAlloc();
-     gpuLock = IOLockAlloc();
+@@ -304,6 +406,9 @@ bool PhxBringup::start(IOService *provider) {
+     pci = OSDynamicCast(IOPCIDevice, provider);
+     if (!pci)
+         return false;
 +    vcnLock = IOLockAlloc();
-     uint32_t dbg = 0;
-     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
-     if (mmio) {
-@@ -384,6 +478,13 @@ void PhxBringup::stop(IOService *provider) {
++    if (!vcnLock)
++        return false;
+     pci->retain();
+     {
+         uint16_t v = pci->configRead16(0);
+@@ -354,6 +459,8 @@ bool PhxBringup::start(IOService *provider) {
+         setProperty("phx-hdp-flush-dword", hdpFlushDword, 32);
+     }
+     setProperty("phx-build", PHX_KEXT_BUILD, 32);
++    if (vcnLock && gpuLock && smuLock && fbAper && mmio && topology)
++        setProperty(PHX_VIDEO_AVC_PROPERTY, static_cast<unsigned long long>(PHX_VIDEO_AVC_VERSION), 32);
+     setProperty("phx-stage", "E3");
+     setProperty("phx-debug", debug);
+     setProperty("phx-fb-aper-phys", fbAperPhys, 64);
+@@ -384,6 +491,15 @@ void PhxBringup::stop(IOService *provider) {
          sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
          gSysctlUp = 0;
      }
 +    if (vcnLock) {
 +        IOLockLock(vcnLock);
++        vcnStopped = true;
 +        uint32_t response = 0;
 +        if (vcnNeedsPowerDown && !isSleeping)
 +            vcnPowerDown(&response);
++        isSleeping = true;
 +        IOLockUnlock(vcnLock);
 +    }
      clearRing();
      if (fbAper) {
          fbAper->release();
-@@ -406,6 +507,10 @@ void PhxBringup::stop(IOService *provider) {
-         IOLockFree(gpuLock);
-         gpuLock = nullptr;
-     }
-+    if (vcnLock) {
-+        IOLockFree(vcnLock);
-+        vcnLock = nullptr;
-+    }
-     if (doorbellMap) {
-         doorbellMap->release();
-         doorbellMap = nullptr;
-@@ -427,13 +532,21 @@ void PhxBringup::stop(IOService *provider) {
+@@ -426,14 +542,29 @@ void PhxBringup::stop(IOService *provider) {
+     IOService::stop(provider);
  }
  
++void PhxBringup::free() {
++    if (vcnLock) IOLockFree(vcnLock);
++    IOService::free();
++}
++
  IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice) {
-+    if (vcnLock)
-+        IOLockLock(vcnLock);
++    IOLockLock(vcnLock);
++    if (vcnStopped) {
++        IOLockUnlock(vcnLock);
++        return IOPMAckImplied;
++    }
      if (ordinal == 0) {
          IOLog("PhxBringup: powerStateWillChange to sleep (state 0)\n");
 +        uint32_t response = 0;
@@ -207,12 +234,11 @@ index c863164..d701d59 100644
          IOLog("PhxBringup: powerStateDidChange from sleep (state 1)\n");
          isSleeping = false;
      }
-+    if (vcnLock)
-+        IOLockUnlock(vcnLock);
++    IOLockUnlock(vcnLock);
      return IOPMAckImplied;
  }
  
-@@ -736,6 +849,18 @@ void PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
+@@ -736,6 +867,22 @@ void PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
      IOLockUnlock(gpuLock);
  }
  
@@ -220,18 +246,22 @@ index c863164..d701d59 100644
 +    return start <= limit && bytes <= limit - start;
 +}
 +
-+static bool vcnFrameOverlap(uint64_t offset, uint64_t bytes, bool encode, uint64_t fbBase = 0) {
++// Queue/TMR adoption reserves the largest shared frame scratch. Submissions
++// check the range actually used. The encoder and decoder share vcnLock.
++static_assert(kEncodeScratchMax >= kDecodeFrameRequiredBytes &&
++              kDecodeFrameScratchOffset + kEncodeScratchMax <= kVisTotal, "VCN scratch exceeds BAR0");
++static bool vcnFrameOverlap(uint64_t offset, uint64_t bytes, uint32_t scratchBytes, uint64_t fbBase = 0) {
 +    const auto intersects = [offset, bytes](uint64_t base, uint64_t length) {
 +        return bytes && (offset < base ? base - offset < bytes : offset - base < length);
 +    };
 +    return intersects(fbBase + kBoOffset, kBoSize) ||
-+           (!encode && intersects(fbBase + kDecodeFrameScratchOffset, kDecodeFrameRequiredBytes));
++           (scratchBytes && intersects(fbBase + kDecodeFrameScratchOffset, scratchBytes));
 +}
 +
  IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
      if (!fbAper || !doorbellMap || !mmio || !fbMcBase || !gpuLock)
          return kIOReturnNotReady;
-@@ -743,8 +868,11 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
+@@ -743,8 +890,11 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
      const uint64_t ringOff = in[0], ringDw = in[1], wbOff = in[2], dbByte = in[3], wptr = in[4], fenceOff = in[5] & ~1ull;
      const uint32_t qi = static_cast<uint32_t>(in[5] & 1);
      if (ringDw < 256 || ringDw > 65536 || (ringDw & (ringDw - 1)) || (ringOff & 0xFF) ||
@@ -240,12 +270,12 @@ index c863164..d701d59 100644
 +        !rangeFits(ringOff, ringDw * 4, fbAperLen) || (wbOff & 7) || !rangeFits(wbOff, 32, fbAperLen) ||
 +        (fenceOff & 7) || !rangeFits(fenceOff, 8, fbAperLen) || (dbByte & 7) ||
 +        !rangeFits(dbByte, 8, doorbellMap->getLength()) || ringOff > UINT32_MAX || wbOff > UINT32_MAX ||
-+        fenceOff > UINT32_MAX || vcnFrameOverlap(ringOff, ringDw * 4, false) ||
-+        vcnFrameOverlap(wbOff, 32, false) || vcnFrameOverlap(fenceOff, 8, false))
++        fenceOff > UINT32_MAX || vcnFrameOverlap(ringOff, ringDw * 4, kEncodeScratchMax) ||
++        vcnFrameOverlap(wbOff, 32, kEncodeScratchMax) || vcnFrameOverlap(fenceOff, 8, kEncodeScratchMax))
          return kIOReturnBadArgument;
      IOLockLock(gpuLock);
      GpuQueue &q = gq[qi];
-@@ -790,6 +918,10 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
+@@ -790,6 +940,10 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
          uint64_t *pte = pa ? vmPte(c, va + p, true) : nullptr;
          if (!pte) {
              r = pa ? kIOReturnNoMemory : kIOReturnVMError;
@@ -256,7 +286,7 @@ index c863164..d701d59 100644
              break;
          }
          *pte = (pa & kPtAddrMask) | kPteSysFlags;
-@@ -1029,7 +1161,7 @@ IOReturn PhxBringup::pspRing(uint32_t op, uint64_t carveOffset, uint64_t out[4])
+@@ -1029,7 +1183,7 @@ IOReturn PhxBringup::pspRing(uint32_t op, uint64_t carveOffset, uint64_t out[4])
      if (op == 1) {
          if (ringMc) {
              r = kIOReturnExclusiveAccess;   // a ring is already live; destroy it first
@@ -265,7 +295,7 @@ index c863164..d701d59 100644
                     PHX_VRAM_FWBUF_OFF + PHX_VRAM_FWBUF_SIZE > fbAperLen) {
              r = kIOReturnBadArgument;        // ring+cmd+fence must sit below the TMR; fw_buf must fit the aperture
          } else {
-@@ -1226,16 +1358,20 @@ IOReturn PhxBringup::pspCtl(uint32_t op, uint32_t arg, uint64_t out[4]) {
+@@ -1226,16 +1380,20 @@ IOReturn PhxBringup::pspCtl(uint32_t op, uint32_t arg, uint64_t out[4]) {
          uint32_t size = arg ? arg : 0x400000u;
          if (size > PHX_VRAM_TMR_CAP)
              size = PHX_VRAM_TMR_CAP;
@@ -290,15 +320,15 @@ index c863164..d701d59 100644
      } else if (op == 2) {
          r = pspRunCmd(PHX_PSP_GFX_CMD_AUTOLOAD_RLC, nullptr, 0, out);
      } else {
-@@ -1250,8 +1386,23 @@ IOReturn PhxBringup::pspCtl(uint32_t op, uint32_t arg, uint64_t out[4]) {
+@@ -1250,8 +1408,23 @@ IOReturn PhxBringup::pspCtl(uint32_t op, uint32_t arg, uint64_t out[4]) {
  IOReturn PhxBringup::pspRaw(uint32_t cmdId, const uint32_t words[6], uint64_t out[4]) {
      if (!mmio || !fbAper)
          return kIOReturnNotReady;
 +    if (cmdId == PHX_PSP_GFX_CMD_SETUP_TMR) {
 +        const uint64_t mc = (static_cast<uint64_t>(words[1]) << 32) | words[0];
 +        const uint64_t phys = (static_cast<uint64_t>(words[5]) << 32) | words[4];
-+        if (vcnFrameOverlap(mc, words[2], false, fbMcBase) ||
-+            ((words[3] & 2u) && vcnFrameOverlap(phys, words[2], false, fbPhys)))
++        if (vcnFrameOverlap(mc, words[2], kEncodeScratchMax, fbMcBase) ||
++            ((words[3] & 2u) && vcnFrameOverlap(phys, words[2], kEncodeScratchMax, fbPhys)))
 +            return kIOReturnBadArgument;
 +    }
      IOLockLock(smuLock);
@@ -314,7 +344,7 @@ index c863164..d701d59 100644
      IOLockUnlock(smuLock);
      return r;
  }
-@@ -1288,6 +1439,1030 @@ IOReturn PhxBringup::smuMessage(uint32_t msg, uint32_t arg, uint32_t *resp, uint
+@@ -1288,6 +1461,1071 @@ IOReturn PhxBringup::smuMessage(uint32_t msg, uint32_t arg, uint32_t *resp, uint
      return r ? kIOReturnSuccess : kIOReturnTimeout;
  }
  
@@ -444,8 +474,8 @@ index c863164..d701d59 100644
 +}
 +
 +void PhxBringup::vcnZeroVram(uint32_t off, uint32_t bytes) {
-+    for (uint32_t i = 0; i + 4u <= bytes; i += 4u)
-+        vcnWriteVram(off + i, 0);
++    if (!fbAper || !rangeFits(off, bytes, fbAperLen)) return;
++    bzero(reinterpret_cast<uint8_t *>(fbAper->getVirtualAddress()) + off, bytes);
 +}
 +
 +void PhxBringup::vcnSharedQueueMode(uint32_t set, uint32_t clear) {
@@ -468,7 +498,33 @@ index c863164..d701d59 100644
 +    out[7] = on && vcnRegOk(kRegRbRptr) ? vrd(kRegRbRptr) : UINT32_MAX;
 +}
 +
++bool PhxBringup::vcnStopDpg() {
++    // vcnLock serializes commands with stop. Only a configured ring has a
++    // usable fw_shared and write pointer. Partial init still needs PG_MODE cleared.
++    bool drained = true;
++    if (vcnReady) {
++        vcnSharedQueueMode(kFwQueueDpgHoldOff, 0);
++        drained = vcnWaitReg(kRegPowerStatus, kPowerStatusMask, kPowerStatusTilesOff, 400);
++        if (drained) {
++            const uint32_t target = vrd(kRegRbWptr);
++            drained = target == vcnRingWptr && vcnWaitReg(kRegRbRptr, UINT32_MAX, target, 400) &&
++                      vcnWaitReg(kRegPowerStatus, kPowerStatusMask, kPowerStatusTilesOff, 400);
++        }
++    }
++    const uint32_t power = vrd(kRegPowerStatus);
++    if (power == UINT32_MAX || power == 0xDEADBEEFu)
++        return false;
++    vwr(kRegPowerStatus, power & ~kPowerStatusPgMode);
++    const uint32_t readback = vrd(kRegPowerStatus);
++    const bool cleared = readback != UINT32_MAX && readback != 0xDEADBEEFu && !(readback & kPowerStatusPgMode);
++    if (cleared) vcnDpgActive = false;
++    return drained && cleared;
++}
++
 +bool PhxBringup::vcnPowerDown(uint32_t *response) {
++    const bool dpgStopped = !vcnDpgActive || vcnStopDpg();
++    if (!dpgStopped)
++        IOLog("PhxBringup: VCN DPG stop incomplete before SMU power down (wptr %u)\n", vcnRingWptr);
 +    // Registers other than PGFSM are only safe while the planes are on.
 +    const bool on = vcnPlanesOn && vcnRegOk(kRegPgfsmStatus) &&
 +                    (vrd(kRegPgfsmStatus) & kPgfsmStatusMask) == kPgfsmPoweredPg;
@@ -499,7 +555,9 @@ index c863164..d701d59 100644
 +    vcnNeedsPowerDown = r != kIOReturnSuccess || *response != kPpsmcResultOk;
 +    if (vcnNeedsPowerDown)
 +        IOLog("PhxBringup: VCN PowerDownVcn failed (kr 0x%08x, response 0x%08x)\n", r, *response);
-+    return !vcnNeedsPowerDown;
++    else
++        vcnDpgActive = false;
++    return !vcnNeedsPowerDown && dpgStopped;
 +}
 +
 +IOReturn PhxBringup::vcnStatus(uint64_t out[8]) {
@@ -557,9 +615,10 @@ index c863164..d701d59 100644
 +            return PHX_VCN_NO_BLOCK;
 +        vwr(kRegPowerStatus, (ps & ~kPowerStatusMask) | kPowerStatusTilesOff);   // disable the anti-hang mechanism
 +        ps = vrd(kRegPowerStatus);
-+        if (ps == UINT32_MAX)
++        if (ps == UINT32_MAX || ps == 0xDEADBEEFu)
 +            return PHX_VCN_NO_BLOCK;
 +        vwr(kRegPowerStatus, ps | kPowerStatusPgMode | kPowerStatusPgEn);
++        vcnDpgActive = true;
 +    } else if (!vcnDpgPgMode) {
 +        uint32_t ps0 = vrd(kRegPowerStatus);
 +        if (ps0 == UINT32_MAX || ps0 == 0xDEADBEEFu)
@@ -568,13 +627,14 @@ index c863164..d701d59 100644
 +    }
 +    if (vcnDpgPgMode) {
 +        uint32_t ps = vrd(kRegPowerStatus);
-+        if (ps == UINT32_MAX)
++        if (ps == UINT32_MAX || ps == 0xDEADBEEFu)
 +            return PHX_VCN_NO_BLOCK;
 +        vwr(kRegPowerStatus, (ps & ~kPowerStatusMask) | kPowerStatusTilesOff);
 +        ps = vrd(kRegPowerStatus);
-+        if (ps == UINT32_MAX)
++        if (ps == UINT32_MAX || ps == 0xDEADBEEFu)
 +            return PHX_VCN_NO_BLOCK;
 +        vwr(kRegPowerStatus, (ps & ~kPowerStatusMask) | kPowerStatusTilesOff | kPowerStatusPgMode | kPowerStatusPgEn);
++        vcnDpgActive = true;
 +    }
 +
 +    // the per-instance block: zero it, then the fw_shared handshake fields
@@ -1156,20 +1216,20 @@ index c863164..d701d59 100644
 +
 +// Caller holds vcnLock and has checked the device is awake. Queue adoption and raw TMR setup also
 +// reserve the fixed offsets so a concurrent operation cannot claim them after this check returns.
-+bool PhxBringup::vcnFrameMemoryOk(bool encode) const {
++bool PhxBringup::vcnFrameMemoryOk(uint32_t scratchBytes) const {
 +    static_assert(kBoOffset + kBoSize <= kCrumbOff && kCrumbOff + (4u + 2u * kCrumbN) * 4u <= kSweepOff &&
 +                  kSweepOff + 16u + kSweepCount * 4u <= kDecodeFrameScratchOffset, "VCN regions overlap");
-+    const uint64_t last = encode ? kBoOffset + kBoSize : kDecodeFrameScratchOffset + kDecodeFrameRequiredBytes;
++    const uint64_t last = scratchBytes ? kDecodeFrameScratchOffset + scratchBytes : kBoOffset + kBoSize;
 +    if (!gpuLock || !smuLock || !pci || last > fbAperLen || last > fbSize)
 +        return false;
 +
 +    IOLockLock(smuLock);
-+    bool ok = tmrSetUp && !vcnFrameOverlap(tmrOff, tmrSize, encode) && !vcnFrameOverlap(fwBufOff, fwBufSize, encode);
++    bool ok = tmrSetUp && !vcnFrameOverlap(tmrOff, tmrSize, scratchBytes) && !vcnFrameOverlap(fwBufOff, fwBufSize, scratchBytes);
 +    IOLockUnlock(smuLock);
 +    IOLockLock(gpuLock);
 +    for (const auto &q : gq) {
-+        if (q.ready && (vcnFrameOverlap(q.ringOff, q.ringDw * 4ull, encode) ||
-+                        vcnFrameOverlap(q.wbOff, 32, encode) || vcnFrameOverlap(q.fenceOff, 8, encode)))
++        if (q.ready && (vcnFrameOverlap(q.ringOff, q.ringDw * 4ull, scratchBytes) ||
++                        vcnFrameOverlap(q.wbOff, 32, scratchBytes) || vcnFrameOverlap(q.fenceOff, 8, scratchBytes)))
 +            ok = false;
 +    }
 +    IOLockUnlock(gpuLock);
@@ -1202,7 +1262,7 @@ index c863164..d701d59 100644
 +        break;
 +    }
 +    children->release();
-+    if (!ok || vcnFrameOverlap(frontPhys, bytes, encode, fbAperPhys))
++    if (!ok || vcnFrameOverlap(frontPhys, bytes, scratchBytes, fbAperPhys))
 +        return false;
 +
 +    // The firmware-only display runs on the primary surface. PhxAMDFB can also point HUBP0 at a
@@ -1212,32 +1272,36 @@ index c863164..d701d59 100644
 +        return false;
 +    const uint64_t scanoutMc = (static_cast<uint64_t>(rreg(addrHi) & 0xffffu) << 32) | rreg(addrLo);
 +    return scanoutMc >= fbMcBase && rangeFits(scanoutMc - fbMcBase, bytes, fbSize) &&
-+           !vcnFrameOverlap(scanoutMc, bytes, encode, fbMcBase);
++           !vcnFrameOverlap(scanoutMc, bytes, scratchBytes, fbMcBase);
 +}
 +
 +bool PhxBringup::vcnEncoderReady() const {
 +    if (!vcnLock || !mmio || !fbAper)
 +        return false;
 +    IOLockLock(vcnLock);
-+    const bool ready = vcnReady && !isSleeping && vcnFrameMemoryOk(true);
++    const bool ready = vcnReady && !isSleeping && vcnFrameMemoryOk(0);
 +    IOLockUnlock(vcnLock);
 +    return ready;
 +}
 +
 +IOReturn PhxBringup::vcnCodecFrame(bool encode, uint8_t *output, uint32_t capacity, uint64_t out[8],
-+                                   const uint8_t *packedNv12) {
++                                   const uint8_t *packedNv12, const EncodeGeometry &g) {
 +    bzero(out, sizeof(uint64_t) * 8u);
-+    if (!vcnLock || !mmio || !fbAper)
++    if (!vcnLock)
 +        return kIOReturnNotReady;
-+    if (!output || capacity < (encode ? kEncodeFrameBitstreamBytes : kDecodeTargetBytes))
++    if (!output || capacity < (encode ? g.bitstreamBytes : kDecodeTargetBytes))
 +        return kIOReturnBadArgument;
 +    IOLockLock(vcnLock);
++    if (vcnStopped || !mmio || !fbAper) {
++        IOLockUnlock(vcnLock);
++        return kIOReturnOffline;
++    }
 +    if (!vcnReady || isSleeping) {
 +        out[0] = PHX_VCN_NOT_READY;
 +        IOLockUnlock(vcnLock);
 +        return kIOReturnSuccess;
 +    }
-+    if (!vcnFrameMemoryOk(encode)) {
++    if (!vcnFrameMemoryOk(encode ? g.scratchBytes : kDecodeFrameRequiredBytes)) {
 +        out[0] = PHX_VCN_FRAME_REGION;
 +        IOLockUnlock(vcnLock);
 +        return kIOReturnSuccess;
@@ -1245,17 +1309,21 @@ index c863164..d701d59 100644
 +
 +    auto *bar = reinterpret_cast<volatile uint8_t *>(fbAper->getVirtualAddress());
 +    const uint64_t contextMc = vcnMc(kBoOffset + kCodecDataOff);
-+    const uint64_t codecMc = vcnMc(kBoOffset);
++    const uint32_t frameBase = g.scratchBytes ? kDecodeFrameScratchOffset : kBoOffset;
++    const uint64_t codecMc = vcnMc(frameBase);
 +    const auto buffers = makeDecodeFrameBuffers(vcnMc(kDecodeFrameScratchOffset));
 +    const auto copyVector = [bar](uint32_t offset, const uint8_t *data, uint32_t size) {
 +        for (uint32_t i = 0; i < size; ++i)
 +            bar[kDecodeFrameScratchOffset + offset + i] = data[i];
 +    };
 +    if (encode) {
-+        vcnZeroVram(kBoOffset + kCodecDataOff, kEncodeFrameRequiredBoSize - kCodecDataOff);
-+        volatile uint8_t *input = bar + kBoOffset + kEncodeFrameInputOff;
++        vcnZeroVram(kBoOffset + kCodecDataOff, kEncodeContextBytes);
++        vcnZeroVram(frameBase + g.cpbOff, g.inputOff - g.cpbOff);
++        // Avoid stale feedback or output being returned if the firmware fails.
++        vcnZeroVram(frameBase + g.bitstreamOff, g.feedbackOff + kEncodeFrameFeedbackBytes - g.bitstreamOff);
++        volatile uint8_t *input = bar + frameBase + g.inputOff;
 +        if (packedNv12)
-+            copyPackedNv12ToEncodeFrame(input, kEncodeFrameInputBytes, packedNv12, PHXN_VCN_NV12_BYTES);
++            copyPackedNv12ToEncodeFrame(input, g.lumaBytes * 3u / 2u, packedNv12, g.width * g.height * 3u / 2u, g);
 +        else
 +            initializeEncodeFrame(input, kEncodeFrameInputBytes);
 +    } else {
@@ -1266,11 +1334,11 @@ index c863164..d701d59 100644
 +    for (uint32_t phase = 1; phase <= 3; ++phase) {
 +        uint32_t ibDw;
 +        if (encode && phase == 2) {
-+            ibDw = buildEncodeFrameIb(vcnIb, contextMc, codecMc + kEncodeFrameCpbOff,
-+                                      codecMc + kEncodeFrameInputOff, codecMc + kEncodeFrameBitstreamOff,
-+                                      codecMc + kEncodeFrameFeedbackOff, phase);
++            ibDw = buildEncodeFrameIb(vcnIb, contextMc, codecMc + g.cpbOff,
++                                      codecMc + g.inputOff, codecMc + g.bitstreamOff,
++                                      codecMc + g.feedbackOff, phase, g);
 +        } else if (encode) {
-+            ibDw = buildEncodeFrameSessionIb(vcnIb, contextMc, phase, phase == 3);
++            ibDw = buildEncodeFrameSessionIb(vcnIb, contextMc, phase, phase == 3, g);
 +        } else if (phase == 2) {
 +            copyVector(kDecodeFrameMessageOffset, kDecodeH264Message, sizeof(kDecodeH264Message));
 +            copyVector(kDecodeFrameMessageOffset + sizeof(kDecodeH264Message), kDecodeH264Parameters,
@@ -1293,14 +1361,17 @@ index c863164..d701d59 100644
 +        if (phase != 2)
 +            continue;
 +        if (encode) {
-+            const auto *feedback = bar + kBoOffset + kEncodeFrameFeedbackOff;
-+            const auto *stream = bar + kBoOffset + kEncodeFrameBitstreamOff;
-+            out[7] = readLe32(feedback + 6u * sizeof(uint32_t));
++            const auto *feedback = bar + frameBase + g.feedbackOff;
++            const auto *stream = bar + frameBase + g.bitstreamOff;
++            const uint32_t reported = readLe32(feedback + 6u * sizeof(uint32_t));
++            out[7] = reported;
 +            uint32_t bytes = 0;
-+            if (encodedH264IdrOk(feedback, kEncodeFrameFeedbackBytes, stream, kEncodeFrameBitstreamBytes, &bytes)) {
-+                for (uint32_t i = 0; i < bytes; ++i)
-+                    output[i] = stream[i];
-+                out[6] = bytes;
++            if (reported && reported <= g.bitstreamBytes) {
++                // Only read the aperture once. Validate in CPU memory before
++                // publishing the length to the requesting user client.
++                memcpy(output, const_cast<const uint8_t *>(stream), reported);
++                if (encodedH264IdrOk(feedback, kEncodeFrameFeedbackBytes, output, reported, &bytes))
++                    out[6] = bytes;
 +            }
 +        } else {
 +            const auto *pixels = bar + kDecodeFrameScratchOffset + kDecodeFrameTargetOffset;
@@ -1345,11 +1416,12 @@ index c863164..d701d59 100644
  bool PhxBringup::claimSession() { return OSCompareAndSwap(0, 1, &sessionOpen); }
  
  void PhxBringup::releaseSession() { OSCompareAndSwap(1, 0, &sessionOpen); }
-@@ -1447,6 +2622,15 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
+@@ -1447,6 +2685,16 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
          case PHXN_SEL_GEMVA:     r = doGemVa(a); break;
          case PHXN_SEL_CTX:       r = doCtx(a); break;
          case PHXN_SEL_SUBMIT:    r = doSubmit(a); break;
-+        case PHXN_SEL_VCN_ENCODE_H264: r = doEncodeH264(a); break;
++        case PHXN_SEL_VCN_ENCODE_H264: r = doEncodeH264(a, false); break;
++        case PHXN_SEL_VCN_ENCODE_H264_SIZED: r = doEncodeH264(a, true); break;
 +        case PHXN_SEL_VCN_ENCODE_READY:
 +            if (!shape(a, 0, 1, 0, 0) || a->asyncWakePort) {
 +                r = kIOReturnBadArgument;
@@ -1361,7 +1433,7 @@ index c863164..d701d59 100644
          case PHXN_SEL_DBG_SMU:   r = doDbgSmu(a); break;
          case PHXN_SEL_DBG_PSP_RING: r = doDbgPspRing(a); break;
          case PHXN_SEL_DBG_VRAM_READ: r = doDbgVramRead(a); break;
-@@ -1461,6 +2645,7 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
+@@ -1461,6 +2709,7 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
          case PHXN_SEL_DBG_SYSMEM: r = doDbgSysMem(a); break;
          case PHXN_SEL_DBG_ADOPTQ: r = doDbgAdoptQueue(a); break;
          case PHXN_SEL_DBG_CLAIM: r = doDbgClaim(a); break;
@@ -1369,42 +1441,66 @@ index c863164..d701d59 100644
          default:                 r = kIOReturnBadArgument; break;
          }
      }
-@@ -2083,6 +3268,137 @@ IOReturn IOAccelPhxNativeClient::doDbgClaim(IOExternalMethodArguments *a) {
+@@ -2083,6 +3332,161 @@ IOReturn IOAccelPhxNativeClient::doDbgClaim(IOExternalMethodArguments *a) {
      return owner->claimAccel();
  }
  
 +
-+IOReturn IOAccelPhxNativeClient::doEncodeH264(IOExternalMethodArguments *a) {
++IOReturn IOAccelPhxNativeClient::doEncodeH264(IOExternalMethodArguments *a, bool sized) {
 +    IOMemoryDescriptor *input = a->structureInputDescriptor;
 +    IOMemoryDescriptor *output = a->structureOutputDescriptor;
-+    // Both fixed buffers are larger than IOKit's in-band limit. Only the published
++    // Supported buffers are larger than IOKit's in-band limit. Only the published
 +    // out-of-line length is copied back by IOConnectCallStructMethod.
 +    const uint32_t capacity = a->structureOutputDescriptorSize;
 +    const uint32_t inlineCapacity = a->structureOutputSize;
 +    a->structureOutputDescriptorSize = 0;
 +    a->structureOutputSize = 0;
-+    if (a->asyncReferenceCount || a->structureVariableOutputData || a->scalarInputCount ||
++    EncodeGeometry g;
++    if (a->scalarInputCount != (sized ? 2u : 0u)) return kIOReturnBadArgument;
++    if (sized && (!a->scalarInput || a->scalarInput[0] > UINT32_MAX || a->scalarInput[1] > UINT32_MAX ||
++                  !sizedEncodeGeometry(static_cast<uint32_t>(a->scalarInput[0]),
++                                       static_cast<uint32_t>(a->scalarInput[1]), g)))
++        return kIOReturnBadArgument;
++    if (a->asyncWakePort || a->asyncReferenceCount || a->structureVariableOutputData ||
 +        a->scalarOutputCount || a->structureInputSize || inlineCapacity ||
-+        !input || input->getLength() != PHXN_VCN_NV12_BYTES ||
-+        !output || output->getLength() != PHXN_VCN_H264_CAPACITY || capacity != PHXN_VCN_H264_CAPACITY)
++        capacity != g.bitstreamBytes)
++        return kIOReturnBadArgument;
++    return owner->encodeH264Descriptors(input, output, g, &a->structureOutputDescriptorSize);
++}
++
++IOReturn PhxBringup::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2,
++                                          void *p3, void *p4) {
++    if (!name || !name->isEqualTo(PHX_VIDEO_AVC_FUNCTION))
++        return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
++    if (!p1 || !p2 || !p3 || p4) return kIOReturnBadArgument;
++    return encodeH264Descriptors(static_cast<IOMemoryDescriptor *>(p1), static_cast<IOMemoryDescriptor *>(p2),
++                                 EncodeGeometry{}, static_cast<uint32_t *>(p3));
++}
++
++IOReturn PhxBringup::encodeH264Descriptors(IOMemoryDescriptor *input, IOMemoryDescriptor *output,
++                                           const EncodeGeometry &g, uint32_t *bytesWritten) {
++    *bytesWritten = 0;
++    const uint32_t inputBytes = g.width * g.height * 3u / 2u;
++    const uint32_t capacity = g.bitstreamBytes;
++    if (!input || input->getLength() != inputBytes || !output || output->getLength() != capacity)
 +        return kIOReturnBadArgument;
 +
-+    static_assert(PHXN_VCN_NV12_BYTES >= PHXN_VCN_H264_CAPACITY, "staging buffer must fit encoder output");
-+    uint8_t *staging = static_cast<uint8_t *>(IOMalloc(PHXN_VCN_NV12_BYTES));
++    const uint32_t stagingBytes = inputBytes > capacity ? inputBytes : capacity;
++    uint8_t *staging = static_cast<uint8_t *>(IOMalloc(stagingBytes));
 +    if (!staging)
 +        return kIOReturnNoMemory;
 +    IOReturn r = input->prepare();
 +    if (r == kIOReturnSuccess) {
-+        IOByteCount copied = input->readBytes(0, staging, PHXN_VCN_NV12_BYTES);
++        IOByteCount copied = input->readBytes(0, staging, inputBytes);
 +        r = input->complete();
-+        if (copied != PHXN_VCN_NV12_BYTES)
++        if (copied != inputBytes)
 +            r = kIOReturnVMError;
 +    }
 +    uint64_t result[8];
 +    if (r == kIOReturnSuccess) {
 +        // Once the packed pixels have been copied to the device the same private
 +        // buffer can receive the stream. Never expose it until close also succeeds.
-+        r = owner->vcnCodecFrame(true, staging, capacity, result, staging);
++        r = vcnCodecFrame(true, staging, capacity, result, staging, g);
 +        if (r == kIOReturnSuccess && result[0] != PHX_VCN_OK)
 +            r = (result[0] == PHX_VCN_NOT_READY || result[0] == PHX_VCN_FRAME_REGION)
 +                ? kIOReturnNotReady : kIOReturnIOError;
@@ -1420,9 +1516,9 @@ index c863164..d701d59 100644
 +        if (copied != size)
 +            r = kIOReturnVMError;
 +        if (r == kIOReturnSuccess)
-+            a->structureOutputDescriptorSize = size;
++            *bytesWritten = size;
 +    }
-+    IOFree(staging, PHXN_VCN_NV12_BYTES);
++    IOFree(staging, stagingBytes);
 +    return r;
 +}
 +
@@ -1507,7 +1603,7 @@ index c863164..d701d59 100644
  // Write back and invalidate the CPU caches over every BO: CPU-written data must be in memory before the GPU reads
  // it, and the CPU must not read stale lines after the GPU wrote. Coarse: WindowServer's BOs (full-screen surfaces
  // among them) made this its hottest loop, hence debug.phxbos_flush.
-@@ -2119,7 +3435,8 @@ struct PhxSurfShareEsc {   // NVRMSurfShareEsc, src/phxaccel/nvrm_surfshare_abi.
+@@ -2119,7 +3523,8 @@ struct PhxSurfShareEsc {   // NVRMSurfShareEsc, src/phxaccel/nvrm_surfshare_abi.
  };
  static_assert(sizeof(PhxSurfShareEsc) == 40, "NVRMSurfShareEsc layout");
  IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
@@ -1517,7 +1613,7 @@ index c863164..d701d59 100644
          return kIOReturnBadArgument;
      static IOService *accel;
      static const OSSymbol *fn;
-@@ -2140,7 +3457,9 @@ IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
+@@ -2140,7 +3545,9 @@ IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
      PhxSurfShareEsc e{};
      e.version = 2;
      e.surfaceID = static_cast<uint32_t>(a->scalarInput[0]);
@@ -2548,13 +2644,13 @@ index 0000000..05a932c
 +#endif // PHX_VCN_ENCODE_H
 diff --git a/src/phxbringup/PhxVcnEncodeFrame.h b/src/phxbringup/PhxVcnEncodeFrame.h
 new file mode 100644
-index 0000000..9bcd5a7
+index 0000000..540040e
 --- /dev/null
 +++ b/src/phxbringup/PhxVcnEncodeFrame.h
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,462 @@
 +// SPDX-License-Identifier: MIT
 +// Copyright 2017 Advanced Micro Devices, Inc. (libdrm reference packets; MIT).
-+// Fixed H.264 IDR encode submission for the VCN 4 unified queue.
++// H.264 IDR encode submission for the VCN 4 unified queue.
 +// Packet layout follows AMD's libdrm tests/amdgpu/vcn_tests.c, encode-frame path.
 +#ifndef PHX_VCN_ENCODE_FRAME_H
 +#define PHX_VCN_ENCODE_FRAME_H
@@ -2581,11 +2677,46 @@ index 0000000..9bcd5a7
 +constexpr uint32_t kEncodeFrameFeedbackOff = kEncodeFrameBitstreamOff + kEncodeFrameBitstreamBytes;
 +constexpr uint32_t kEncodeFrameRequiredBoSize = kEncodeFrameFeedbackOff + kEncodeFrameFeedbackBytes;
 +
++// The legacy path keeps the exact libdrm layout. Larger frames share the
++// decoder's scratch aperture, exclusively owned under vcnLock through close.
++constexpr uint32_t kEncodeScratchMax = 26u << 20;
++struct EncodeGeometry {
++    uint32_t width = kEncodeFrameWidth, height = kEncodeFrameHeight;
++    uint32_t codedWidth = kEncodeFrameWidth, codedHeight = kEncodeFrameHeight;
++    uint32_t pitch = kEncodeFramePitch, lumaBytes = kEncodeFrameLumaBytes;
++    uint32_t recLumaBytes = kEncodeFrameLumaBytes, bitstreamBytes = kEncodeFrameBitstreamBytes;
++    uint32_t cpbOff = kEncodeFrameCpbOff, inputOff = kEncodeFrameInputOff;
++    uint32_t bitstreamOff = kEncodeFrameBitstreamOff, feedbackOff = kEncodeFrameFeedbackOff;
++    uint32_t scratchBytes = 0, level = 11;
++};
++
++inline bool sizedEncodeGeometry(uint32_t width, uint32_t height, EncodeGeometry &g) {
++    if (!phxnVcnSizeSupported(width, height)) return false;
++    g.width = width;
++    g.height = height;
++    g.codedWidth = (width + 15u) & ~15u;
++    g.codedHeight = (height + 15u) & ~15u;
++    g.pitch = (width + 255u) & ~255u;
++    g.lumaBytes = g.pitch * g.codedHeight;
++    g.recLumaBytes = g.pitch * (g.codedHeight < 256u ? 256u : g.codedHeight);
++    g.bitstreamBytes = phxnVcnBitstreamCapacity(width, height);
++    g.cpbOff = 0;
++    g.inputOff = 3u * g.recLumaBytes; // two reconstructed NV12 pictures
++    g.bitstreamOff = g.inputOff + g.lumaBytes * 3u / 2u;
++    g.feedbackOff = (g.bitstreamOff + g.bitstreamBytes + 4095u) & ~4095u;
++    g.scratchBytes = g.feedbackOff + kEncodeFrameFeedbackBytes;
++    // Allow up to 60 frames/second for the selected level's macroblock rate.
++    uint32_t mb = (g.codedWidth / 16u) * (g.codedHeight / 16u);
++    g.level = mb <= 1800u ? 31u : mb <= 3600u ? 32u : mb <= 8192u ? 42u : 52u;
++    return g.scratchBytes <= kEncodeScratchMax;
++}
++
 +// Count includes the eight-dword unified header and every firmware package.
 +constexpr uint32_t kEncodeFrameIbDw = 449u;
++constexpr uint32_t kEncodeFrameMaxIbDw = kEncodeFrameIbDw + 12u;
 +constexpr uint32_t kEncodeFrameOpenIbDw = 99u;
 +constexpr uint32_t kEncodeFrameCloseIbDw = 21u;
-+static_assert(kEncodeFrameIbDw * sizeof(uint32_t) <= kCodecDataOff - kCodecIbOff, "VCN frame IB space");
++static_assert(kEncodeFrameMaxIbDw * sizeof(uint32_t) <= kCodecDataOff - kCodecIbOff, "VCN frame IB space");
 +static_assert(kEncodeFrameRequiredBoSize <= kBoSize, "VCN frame exceeds the reserved BO");
 +
 +inline void encodeFramePackageHeader(uint32_t *words, uint32_t &cursor, uint32_t tag,
@@ -2622,18 +2753,27 @@ index 0000000..9bcd5a7
 +    return true;
 +}
 +
-+// The firmware pitches are in plane elements: 256 Y samples or 128 interleaved UV pairs.
++// Input pitches are in plane elements (Y samples or interleaved UV pairs).
 +inline bool copyPackedNv12ToEncodeFrame(volatile uint8_t *pixels, uint32_t capacity,
-+                                        const uint8_t *packed, uint32_t length) {
-+    if (!pixels || capacity < kEncodeFrameInputBytes || !packed || length != PHXN_VCN_NV12_BYTES)
++                                        const uint8_t *packed, uint32_t length, const EncodeGeometry &g = {}) {
++    if (!pixels || capacity < g.lumaBytes * 3u / 2u || !packed || length != g.width * g.height * 3u / 2u)
 +        return false;
-+    for (uint32_t y = 0; y < kEncodeFrameHeight * 3u / 2u; ++y) {
-+        volatile uint8_t *row = pixels + y * kEncodeFramePitch;
-+        for (uint32_t x = 0; x < kEncodeFrameWidth; ++x)
-+            row[x] = packed[y * kEncodeFrameWidth + x];
-+        const uint8_t padding = y < kEncodeFrameHeight ? 16u : 128u;
-+        for (uint32_t x = kEncodeFrameWidth; x < kEncodeFramePitch; ++x)
-+            row[x] = padding;
++    for (uint32_t plane = 0; plane < 2; ++plane) {
++        const uint32_t rows = g.height >> plane, codedRows = g.codedHeight >> plane;
++        const uint8_t *src = packed + (plane ? g.width * g.height : 0u);
++        volatile uint8_t *dst = pixels + (plane ? g.lumaBytes : 0u);
++        for (uint32_t y = 0; y < codedRows; ++y) {
++            uint32_t x = 0;
++            if (y < rows) {
++                // BAR0 is a prefetchable framebuffer aperture. Copy each visible
++                // row in bulk so 1440p input does not take one MMIO write per byte.
++                __builtin_memcpy(const_cast<uint8_t *>(dst), src, g.width);
++                x = g.width;
++                src += g.width;
++            }
++            __builtin_memset(const_cast<uint8_t *>(dst) + x, plane ? 128u : 16u, g.pitch - x);
++            dst += g.pitch;
++        }
 +    }
 +    return true;
 +}
@@ -2670,18 +2810,18 @@ index 0000000..9bcd5a7
 +}
 +
 +inline uint32_t buildEncodeFrameSessionIb(uint32_t *words, uint64_t contextMc,
-+                                          uint32_t taskId, bool close) {
++                                          uint32_t taskId, bool close, const EncodeGeometry &g = {}) {
 +    uint32_t cursor = encodeFrameIbHeader(words, contextMc, taskId, false);
 +    if (close) {
 +        words[cursor++] = 8;
 +        words[cursor++] = 0x01000002; // close session
 +    } else {
 +        // Length in bytes, tag, then payload for each firmware package.
-+        constexpr uint32_t init[] = {
++        const uint32_t init[] = {
 +            8, 0x01000001, // initialize
-+            44, 3, 1, kEncodeFrameWidth, kEncodeFrameHeight, 0, 0, 0, 0, 0, 0, // H.264 session
-+            16, 0x00200001, 0, (kEncodeFrameWidth / 16) * (kEncodeFrameHeight / 16), // single slice
-+            44, 0x00200002, 0, 0, 0, 1, 1, 100, 11, 0, 0, // H.264 high profile, level 1.1
++            44, 3, 1, g.codedWidth, g.codedHeight, g.codedWidth - g.width, g.codedHeight - g.height, 0, 0, 0, 0,
++            16, 0x00200001, 0, (g.codedWidth / 16) * (g.codedHeight / 16), // single slice
++            44, 0x00200002, 0, 0, 0, 1, 1, 100, g.level, 0, 0, // H.264 High profile
 +            28, 0x00200004, 0, 0, 0, 0, 0, // deblocking filter
 +            16, 4, 1, 1, // layer control
 +            16, 6, 0, 48, // rate-control session
@@ -2701,20 +2841,75 @@ index 0000000..9bcd5a7
 +    return finishEncodeFrameIb(words, cursor);
 +}
 +
-+// Caller supplies kEncodeFrameIbDw dwords and holds all five MC ranges through the fence.
++// RBSP for the same High-profile PPS and IDR slice template used by libdrm.
++// The largest supported dimensions need fewer than 24 bytes before escaping.
++struct EncodeSpsBits {
++    uint8_t bytes[32]{};
++    uint32_t count = 0;
++    void bit(uint32_t value) {
++        bytes[count / 8u] |= (value & 1u) << (7u - count % 8u);
++        ++count;
++    }
++    void ue(uint32_t value) {
++        uint32_t bits = 0;
++        for (uint32_t n = value + 1u; n; n >>= 1u) ++bits;
++        for (uint32_t i = 1u; i < bits; ++i) bit(0u);
++        while (bits) bit((value + 1u) >> --bits);
++    }
++};
++
++inline uint32_t buildSizedSps(const EncodeGeometry &g, uint8_t nal[48]) {
++    EncodeSpsBits s;
++    s.ue(0); s.ue(1); // SPS id, chroma_format_idc (4:2:0)
++    s.ue(0); s.ue(0); s.bit(0); s.bit(0); // 8-bit, no QP bypass/scaling matrices
++    s.ue(1); s.ue(0); s.ue(1); // five-bit frame_num and type-0 five-bit POC
++    s.ue(2); s.bit(0); // reference frames, gaps flag
++    s.ue(g.codedWidth / 16u - 1u);
++    s.ue(g.codedHeight / 16u - 1u);
++    s.bit(1); s.bit(1); // progressive, direct_8x8_inference
++    bool crop = g.codedWidth != g.width || g.codedHeight != g.height;
++    s.bit(crop);
++    if (crop) {
++        s.ue(0); s.ue((g.codedWidth - g.width) / 2u);
++        s.ue(0); s.ue((g.codedHeight - g.height) / 2u);
++    }
++    s.bit(0); // VUI absent (NV12 video-range default)
++    s.bit(1); // rbsp_stop_one_bit, followed by zero padding
++    const uint8_t prefix[] = {0, 0, 0, 1, 0x67, 100, 0x44, static_cast<uint8_t>(g.level)};
++    uint32_t length = 0, zeros = 0;
++    for (uint8_t byte : prefix) nal[length++] = byte;
++    for (uint32_t i = 0; i < (s.count + 7u) / 8u; ++i) {
++        const uint8_t byte = s.bytes[i];
++        if (zeros == 2u && byte <= 3u) { nal[length++] = 3u; zeros = 0; }
++        nal[length++] = byte;
++        zeros = byte == 0u ? zeros + 1u : 0u;
++    }
++    return length;
++}
++
++// Caller supplies kEncodeFrameMaxIbDw dwords for sized frames and holds the MC ranges through the fence.
 +inline uint32_t buildEncodeFrameIb(uint32_t *words, uint64_t contextMc, uint64_t cpbMc,
 +                                   uint64_t inputMc, uint64_t bitstreamMc, uint64_t feedbackMc,
-+                                   uint32_t taskId) {
++                                   uint32_t taskId, const EncodeGeometry &g = {}) {
 +    uint32_t cursor = encodeFrameIbHeader(words, contextMc, taskId, true);
 +    uint32_t packageStart = 0;
 +    encodeFramePackageHeader(words, cursor, 0x0au, packageStart); // direct SPS NAL output
 +    words[cursor++] = 2u;
-+    words[cursor++] = 17u;
-+    words[cursor++] = 1u;
-+    words[cursor++] = 0x6764440bu;
-+    words[cursor++] = 0xac54c284u;
-+    words[cursor++] = 0x68078442u;
-+    words[cursor++] = 0x37000000u;
++    if (g.scratchBytes) {
++        uint8_t nal[48]{};
++        uint32_t length = buildSizedSps(g, nal);
++        words[cursor++] = length;
++        for (uint32_t i = 0; i < length; i += 4u)
++            words[cursor++] = (uint32_t(nal[i]) << 24) | (uint32_t(nal[i + 1u]) << 16) |
++                              (uint32_t(nal[i + 2u]) << 8) | nal[i + 3u];
++    } else {
++        words[cursor++] = 17u;
++        words[cursor++] = 1u;
++        words[cursor++] = 0x6764440bu;
++        words[cursor++] = 0xac54c284u;
++        words[cursor++] = 0x68078442u;
++        words[cursor++] = 0x37000000u;
++    }
 +    encodeFramePackageFinish(words, packageStart, cursor);
 +
 +    encodeFramePackageHeader(words, cursor, 0x0au, packageStart); // direct PPS NAL output
@@ -2740,14 +2935,14 @@ index 0000000..9bcd5a7
 +
 +    encodeFramePackageHeader(words, cursor, 0x0fu, packageStart); // encode parameters
 +    words[cursor++] = 2u; // IDR frame
-+    words[cursor++] = kEncodeFrameBitstreamBytes;
++    words[cursor++] = g.bitstreamBytes;
 +    words[cursor++] = static_cast<uint32_t>(inputMc >> 32);
 +    words[cursor++] = static_cast<uint32_t>(inputMc);
-+    const uint64_t chromaMc = inputMc + kEncodeFrameLumaBytes;
++    const uint64_t chromaMc = inputMc + g.lumaBytes;
 +    words[cursor++] = static_cast<uint32_t>(chromaMc >> 32);
 +    words[cursor++] = static_cast<uint32_t>(chromaMc);
-+    words[cursor++] = kEncodeFramePitch;
-+    words[cursor++] = kEncodeFramePitch / 2u; // chroma pitch in RG8 elements
++    words[cursor++] = g.pitch;
++    words[cursor++] = g.pitch / 2u; // chroma pitch in RG8 elements
 +    words[cursor++] = 0u;
 +    words[cursor++] = 0xffffffffu;
 +    words[cursor++] = 0u;
@@ -2769,15 +2964,15 @@ index 0000000..9bcd5a7
 +    words[cursor++] = static_cast<uint32_t>(cpbMc >> 32);
 +    words[cursor++] = static_cast<uint32_t>(cpbMc);
 +    words[cursor++] = 0u; // linear swizzle
-+    words[cursor++] = kEncodeFramePitch;
-+    words[cursor++] = kEncodeFramePitch;
++    words[cursor++] = g.pitch;
++    words[cursor++] = g.pitch;
 +    words[cursor++] = 2u; // no reconstructed picture
 +    words[cursor++] = 0u;
-+    words[cursor++] = kEncodeFrameLumaBytes;
++    words[cursor++] = g.recLumaBytes;
 +    words[cursor++] = 0u;
 +    words[cursor++] = 0u;
-+    words[cursor++] = kEncodeFrameLumaBytes * 3u / 2u;
-+    words[cursor++] = kEncodeFrameLumaBytes * 5u / 2u;
++    words[cursor++] = g.recLumaBytes * 3u / 2u;
++    words[cursor++] = g.recLumaBytes * 5u / 2u;
 +    for (uint32_t i = 0; i < 280u; ++i)
 +        words[cursor++] = 0u;
 +    encodeFramePackageFinish(words, packageStart, cursor);
@@ -2786,7 +2981,7 @@ index 0000000..9bcd5a7
 +    words[cursor++] = 0u;
 +    words[cursor++] = static_cast<uint32_t>(bitstreamMc >> 32);
 +    words[cursor++] = static_cast<uint32_t>(bitstreamMc);
-+    words[cursor++] = kEncodeFrameBitstreamBytes;
++    words[cursor++] = g.bitstreamBytes;
 +    words[cursor++] = 0u;
 +    encodeFramePackageFinish(words, packageStart, cursor);
 +
@@ -2822,7 +3017,7 @@ index 0000000..9bcd5a7
 +    encodeFramePackageHeader(words, cursor, 0x01000003u, packageStart); // encode frame
 +    encodeFramePackageFinish(words, packageStart, cursor);
 +
-+    if (cursor != kEncodeFrameIbDw)
++    if (cursor > kEncodeFrameMaxIbDw)
 +        return 0;
 +    return finishEncodeFrameIb(words, cursor);
 +}
@@ -2917,13 +3112,15 @@ index 0000000..9bcd5a7
 +#endif // PHX_VCN_ENCODE_FRAME_H
 diff --git a/src/phxbringup/PhxVcnUserABI.h b/src/phxbringup/PhxVcnUserABI.h
 new file mode 100644
-index 0000000..10244fe
+index 0000000..e60e29b
 --- /dev/null
 +++ b/src/phxbringup/PhxVcnUserABI.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,44 @@
 +/* Synchronous Phoenix H.264 encoder methods on the N48N user client after HELLO. */
 +#ifndef PHX_VCN_USER_ABI_H
 +#define PHX_VCN_USER_ABI_H
++
++#include <stdint.h>
 +
 +#define PHXN_VCN_MIN_BUILD 64u
 +#define PHXN_VCN_WIDTH 160u
@@ -2939,13 +3136,36 @@ index 0000000..10244fe
 +   VCN can accept a frame. Readiness may change before the next submission. */
 +#define PHXN_SEL_VCN_ENCODE_READY 32u
 +
++/* Build 65. IOConnectCallMethod, scalars [width,height], no scalar outputs,
++   packed video-range NV12 input and one Annex-B output. Selector 31 remains
++   available for applications using the build 64 fixed-size ABI. */
++#define PHXN_VCN_SIZED_MIN_BUILD 65u
++#define PHXN_SEL_VCN_ENCODE_H264_SIZED 33u
++#define PHXN_VCN_MIN_DIMENSION 128u
++#define PHXN_VCN_MAX_LONG_EDGE 2560u
++#define PHXN_VCN_MAX_SHORT_EDGE 1440u
++static inline int phxnVcnSizeSupported(uint32_t w, uint32_t h) {
++    return w >= PHXN_VCN_MIN_DIMENSION && h >= PHXN_VCN_MIN_DIMENSION &&
++           w <= PHXN_VCN_MAX_LONG_EDGE && h <= PHXN_VCN_MAX_LONG_EDGE &&
++           (w <= PHXN_VCN_MAX_SHORT_EDGE || h <= PHXN_VCN_MAX_SHORT_EDGE) && !((w | h) & 1u);
++}
++static inline uint32_t phxnVcnPackedBytes(uint32_t w, uint32_t h) {
++    return phxnVcnSizeSupported(w, h) ? w * h * 3u / 2u : 0u;
++}
++static inline uint32_t phxnVcnBitstreamCapacity(uint32_t w, uint32_t h) {
++    if (!phxnVcnSizeSupported(w, h)) return 0u;
++    /* Two bytes per coded pixel plus header space, in whole pages. */
++    uint32_t codedPixels = ((w + 15u) & ~15u) * ((h + 15u) & ~15u);
++    return (2u * codedPixels + 4096u + 4095u) & ~4095u;
++}
++
 +#endif
 diff --git a/src/phxbringup/tests/vcn_host_test.cpp b/src/phxbringup/tests/vcn_host_test.cpp
 new file mode 100644
-index 0000000..90ed47f
+index 0000000..ef211a6
 --- /dev/null
 +++ b/src/phxbringup/tests/vcn_host_test.cpp
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,491 @@
 +// Host test for the pure parts of the VCN bring-up: the firmware-header check, the VRAM layout arithmetic and
 +// the constants that are derived rather than copied. Built and run by tests/vcn_selftest.sh; it never touches
 +// hardware.
@@ -3364,6 +3584,54 @@ index 0000000..90ed47f
 +    CHECK_EQ(size, 4u);
 +}
 +
++static void testSizedEncode() {
++    EncodeGeometry g;
++    CHECK(!sizedEncodeGeometry(961, 540, g));
++    CHECK(!sizedEncodeGeometry(960, 541, g));
++    CHECK(!sizedEncodeGeometry(UINT32_MAX, 128, g));
++    CHECK(!sizedEncodeGeometry(2562, 1440, g));
++    CHECK(!sizedEncodeGeometry(1920, 1920, g));
++    CHECK(!sizedEncodeGeometry(120, 144, g));
++    const uint32_t sizes[][2] = {{128,128}, {160,128}, {640,480}, {854,480}, {960,540},
++        {962,542}, {1280,720}, {1920,1080}, {2048,1152}, {2560,1440}, {1440,2560}};
++    for (const auto &size : sizes) {
++        CHECK(sizedEncodeGeometry(size[0], size[1], g));
++        CHECK_EQ(g.codedWidth, (size[0] + 15u) & ~15u);
++        CHECK_EQ(g.codedHeight, (size[1] + 15u) & ~15u);
++        CHECK_EQ(g.pitch % 256, 0u);
++        CHECK_EQ(g.inputOff, 3u * g.recLumaBytes);
++        CHECK(g.bitstreamOff >= g.inputOff + g.lumaBytes * 3u / 2u);
++        CHECK(g.bitstreamOff + g.bitstreamBytes <= g.feedbackOff);
++        CHECK(g.scratchBytes <= kEncodeScratchMax);
++        uint32_t words[kEncodeFrameMaxIbDw + 1]{};
++        words[kEncodeFrameMaxIbDw] = 0xdeadbeef;
++        buildEncodeFrameSessionIb(words, 0x8100000000u, 1, false, g);
++        CHECK_EQ(words[24], g.codedWidth);
++        CHECK_EQ(words[25], g.codedHeight);
++        CHECK_EQ(words[26], g.codedWidth - g.width);
++        CHECK_EQ(words[27], g.codedHeight - g.height);
++        uint32_t n = buildEncodeFrameIb(words, 0x8100000000u, 0x8200000000u, 0x8300000000u,
++                                        0x8400000000u, 0x8500000000u, 2, g);
++        CHECK(n && n <= kEncodeFrameMaxIbDw);
++        CHECK_EQ(words[kEncodeFrameMaxIbDw], 0xdeadbeefu);
++        uint32_t checksum = 0;
++        for (uint32_t i = 4; i < n; ++i) checksum += words[i];
++        CHECK_EQ(checksum, words[2]);
++    }
++    CHECK(sizedEncodeGeometry(962, 542, g));
++    std::vector<uint8_t> packed(phxnVcnPackedBytes(g.width, g.height), 97u);
++    std::fill(packed.begin() + g.width * g.height, packed.end(), 155u);
++    std::vector<uint8_t> dst(g.lumaBytes * 3u / 2u + 1u, 0xabu);
++    CHECK(copyPackedNv12ToEncodeFrame(dst.data(), dst.size()-1u, packed.data(), packed.size(), g));
++    CHECK_EQ(dst[g.width - 1u], 97u);
++    CHECK_EQ(dst[g.width], 16u);
++    CHECK_EQ(dst[g.height * g.pitch], 16u);
++    CHECK_EQ(dst[g.lumaBytes], 155u);
++    CHECK_EQ(dst[g.lumaBytes + g.width], 128u);
++    CHECK_EQ(dst[g.lumaBytes + (g.height / 2u) * g.pitch], 128u);
++    CHECK_EQ(dst.back(), 0xabu);
++}
++
 +int main(int argc, char **argv) {
 +    testLayout();
 +    testDpgList();
@@ -3373,6 +3641,7 @@ index 0000000..90ed47f
 +    testEncodeSession();
 +    testEncodeFramePackets();
 +    testEncodeFrameBuffers();
++    testSizedEncode();
 +    const char *path = argc > 1 ? argv[1] : "/Users/Shared/gpu/fw/vcn_4_0_0.bin";
 +    bool ok = false;
 +    std::vector<unsigned char> fw = readFile(path, ok);
@@ -4639,3 +4908,158 @@ index 0000000..4b7aae5
 +    IOServiceClose(gConn);
 +    return rc;
 +}
+diff --git a/src/phxaccel/PhxVideoAVC.h b/src/phxaccel/PhxVideoAVC.h
+new file mode 100644
+index 0000000..5a85cd8
+--- /dev/null
++++ b/src/phxaccel/PhxVideoAVC.h
+@@ -0,0 +1,17 @@
++/* Phoenix video-context ABI v1. One synchronous 160x128 NV12 -> H.264 IDR. */
++#ifndef PHX_VIDEO_AVC_H
++#define PHX_VIDEO_AVC_H
++
++#include "../phxbringup/PhxVcnUserABI.h"
++
++#define PHX_VIDEO_AVC_PROPERTY "PhxVideoAVCABI"
++#define PHX_VIDEO_AVC_VERSION 1u
++/* IOConnectCallStructMethod on this accelerator's video context only. No scalars.
++ * Input: PHXN_VCN_NV12_BYTES. Output capacity: PHXN_VCN_H264_CAPACITY.
++ * The returned byte count is the length of one completed Annex B access unit. */
++#define PHX_VIDEO_ENCODE_AVC 0x50484131u
++
++#ifdef KERNEL
++#define PHX_VIDEO_AVC_FUNCTION "PhxEncodeAVCFrameV1"
++#endif
++#endif
+diff --git a/src/phxaccel/accel/iofam/IOAccelContext2.h b/src/phxaccel/accel/iofam/IOAccelContext2.h
+index 5c362c3..282af5b 100644
+--- a/src/phxaccel/accel/iofam/IOAccelContext2.h
++++ b/src/phxaccel/accel/iofam/IOAccelContext2.h
+@@ -11,6 +11,11 @@ enum { kIOAccelContext2Size = 0x10a8 };
+ class IOAccelContext2 : public IOAccelSubmitter2 {
+     OSDeclareDefaultStructors(IOAccelContext2);
+ public:
++    // IOAcceleratorFamily2 exports both inherited overrides on x86_64 Tahoe.
++    void free() APPLE_KEXT_OVERRIDE;
++    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
++                            IOExternalMethodDispatch *dispatch, OSObject *target,
++                            void *reference) APPLE_KEXT_OVERRIDE;
+     virtual void * getOwningTask() const APPLE_KEXT_OVERRIDE;
+     virtual void * getGPUTask() const APPLE_KEXT_OVERRIDE;
+     virtual void getOwningTaskPid() const APPLE_KEXT_OVERRIDE;
+diff --git a/src/phxaccel/accel/nvaccel_stubs.h b/src/phxaccel/accel/nvaccel_stubs.h
+index 48d6d9e..410d778 100644
+--- a/src/phxaccel/accel/nvaccel_stubs.h
++++ b/src/phxaccel/accel/nvaccel_stubs.h
+@@ -184,5 +184,13 @@ class NVVideoContext : public IOAccelVideoContext2 {
+     OSDeclareDefaultStructors(NVVideoContext)
+     NM_TAHOE_FWD(NVVideoContext)
+ public:
++#if defined(NMX_ACCEL) && defined(PHX_FB)
++    IOService *avcBackend = nullptr; // retained from the accelerator's own PCI device before publication
++    void free() APPLE_KEXT_OVERRIDE;
++    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
++                            IOExternalMethodDispatch *dispatch, OSObject *target,
++                            void *reference) APPLE_KEXT_OVERRIDE;
++    static IOReturn encodeAVC(OSObject *target, void *, IOExternalMethodArguments *arguments);
++#endif
+ };
+ OSDefineMetaClassAndStructors(NVVideoContext, IOAccelVideoContext2)
+diff --git a/src/phxaccel/accel/nvrm-accel.cpp b/src/phxaccel/accel/nvrm-accel.cpp
+index f124ccb..0b7fcd0 100644
+--- a/src/phxaccel/accel/nvrm-accel.cpp
++++ b/src/phxaccel/accel/nvrm-accel.cpp
+@@ -44,6 +44,64 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
+ #include <IOKit/IODeviceMemory.h>
+ #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
+ #include "nvaccel_stubs.h"
++#if defined(NMX_ACCEL) && defined(PHX_FB)
++#include "../PhxVideoAVC.h"
++
++static IOService *copyPhoenixAVCBackend(IOService *pci) {
++    if (!OSDynamicCast(IOPCIDevice, pci)) return nullptr;
++    const OSSymbol *category = OSSymbol::withCString("PhxBringup");
++    if (!category) return nullptr;
++    IOService *service = pci->copyClientWithCategory(category);
++    category->release();
++    if (!service) return nullptr;
++    OSObject *value = service->copyProperty(PHX_VIDEO_AVC_PROPERTY);
++    OSNumber *version = OSDynamicCast(OSNumber, value);
++    bool supported = version && version->unsigned64BitValue() == PHX_VIDEO_AVC_VERSION;
++    if (value) value->release();
++    if (supported) return service;
++    service->release();
++    return nullptr;
++}
++
++void NVVideoContext::free() {
++    if (avcBackend) avcBackend->release();
++    IOAccelContext2::free();
++}
++
++IOReturn NVVideoContext::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++                                        IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
++    static IOExternalMethodDispatch encode = { &NVVideoContext::encodeAVC, 0, PHXN_VCN_NV12_BYTES,
++                                               0, PHXN_VCN_H264_CAPACITY };
++    if (selector == PHX_VIDEO_ENCODE_AVC) {
++        dispatch = &encode;
++        target = this;
++        reference = nullptr;
++    }
++    // The family checks that the context is active. IOKit validates the method's
++    // input/output shape before calling encodeAVC outside the family submission lock.
++    return IOAccelContext2::externalMethod(selector, a, dispatch, target, reference);
++}
++
++IOReturn NVVideoContext::encodeAVC(OSObject *target, void *, IOExternalMethodArguments *a) {
++    auto *context = OSDynamicCast(NVVideoContext, target);
++    uint32_t capacity = a->structureOutputDescriptorSize;
++    a->structureOutputDescriptorSize = 0;
++    if (!context || context->getOwningTask() != current_task()) return kIOReturnNotPermitted;
++    if (a->asyncWakePort || a->asyncReferenceCount || a->structureVariableOutputData ||
++        a->scalarInputCount || a->scalarOutputCount || a->structureInputSize || a->structureOutputSize ||
++        !a->structureInputDescriptor || a->structureInputDescriptor->getLength() != PHXN_VCN_NV12_BYTES ||
++        !a->structureOutputDescriptor || a->structureOutputDescriptor->getLength() != PHXN_VCN_H264_CAPACITY ||
++        capacity != PHXN_VCN_H264_CAPACITY) return kIOReturnBadArgument;
++    if (!context->avcBackend) return kIOReturnNotReady;
++    uint32_t bytes = 0;
++    IOReturn r = context->avcBackend->callPlatformFunction(PHX_VIDEO_AVC_FUNCTION, false,
++                                   a->structureInputDescriptor, a->structureOutputDescriptor, &bytes, nullptr);
++    if (r != kIOReturnSuccess) return r;
++    if (!bytes || bytes > capacity) return kIOReturnIOError;
++    a->structureOutputDescriptorSize = bytes;
++    return kIOReturnSuccess;
++}
++#endif
+ #ifndef NMX_ACCEL
+ #include "nvkms-kapi.h"
+ #endif
+@@ -270,7 +328,14 @@ public:
+     OSObject *newCLContext() APPLE_KEXT_OVERRIDE { NVCLContext *c = OSTypeAlloc(NVCLContext); ALOG("newCLContext -> %p", c); return c; }
+     OSObject *newSurface() APPLE_KEXT_OVERRIDE { NVSurface *o = OSTypeAlloc(NVSurface); ALOG("newSurface -> %p", o); return o; }
+     OSObject *new2DContext() APPLE_KEXT_OVERRIDE { NV2DContext *c = OSTypeAlloc(NV2DContext); ALOG("new2DContext -> %p", c); return c; }
+-    OSObject *newVideoContext() APPLE_KEXT_OVERRIDE { NVVideoContext *c = OSTypeAlloc(NVVideoContext); ALOG("newVideoContext -> %p", c); return c; }
++    OSObject *newVideoContext() APPLE_KEXT_OVERRIDE {
++        NVVideoContext *c = OSTypeAlloc(NVVideoContext);
++#if defined(NMX_ACCEL) && defined(PHX_FB)
++        if (c) c->avcBackend = copyPhoenixAVCBackend(getProvider());
++#endif
++        ALOG("newVideoContext -> %p", c);
++        return c;
++    }
+     OSObject *newSysMemory() APPLE_KEXT_OVERRIDE { NVSysMemory *m = OSTypeAlloc(NVSysMemory); ALOG("newSysMemory -> %p", m); return m; }
+     OSObject *newVidMemory() APPLE_KEXT_OVERRIDE { NVVidMemory *m = OSTypeAlloc(NVVidMemory); ALOG("newVidMemory -> %p", m); return m; }
+     OSObject *newResource() APPLE_KEXT_OVERRIDE { NVResource *r = OSTypeAlloc(NVResource); OSAddAtomic64(1, &gCntResNew); ALOG("newResource -> %p", r); return r; }
+@@ -672,6 +737,12 @@ public:
+             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
+             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
+             setProperty("NVAccelSurfaceWait", 1ULL, 32);
++#if defined(NMX_ACCEL) && defined(PHX_FB)
++            if (IOService *avc = copyPhoenixAVCBackend(provider)) {
++                setProperty(PHX_VIDEO_AVC_PROPERTY, static_cast<unsigned long long>(PHX_VIDEO_AVC_VERSION), 32);
++                avc->release();
++            }
++#endif
+             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
+             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
+             for (unsigned i = 0; i < NV_CARRIERS; i++) {

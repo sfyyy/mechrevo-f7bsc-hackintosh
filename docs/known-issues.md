@@ -588,6 +588,7 @@ WindowServer 每次阻塞等待的屏幕合成拆开（60 Hz 动画，单位 ms�
 - 腾讯会议启动时记录 `no hw h264 encoder ablity` 和 `no hw hevc encoder ablity`，软件编码 2560×1440 HEVC 时 CPU 温度曾达 88–91 °C。向日葵远控日志报告 `support hevc 0`。
 - PhxBringup build 64 真机验收通过。普通用户程序注册 Phoenix 编码器后，VideoToolbox 完成了八帧 160×128 H.264 硬编码，独立软件解码通过亮度和色度校验。[接入说明](../macos/nullarc/vcn/README.md)
 - 全新进程未经注册直接要求系统硬件时，H.264 和 HEVC 的编码会话仍返回 `-12908`，解码会话仍返回 `-12906`。应用硬解码和 HEVC 仍待实现。
+- 本机 26.7.1 的系统视频插件扫描会按 Apple 签名要求过滤 Phoenix。单独安装编码器 bundle 后，全新进程仍无法枚举它。腾讯会议实际用 r264 处理过 2048×1152 和 2560×1440 的全范围输入。build 65 候选已经支持这两档尺寸的参数与缓冲区，VCN 输出仍待上机验证。[测试结果](../macos/nullarc/vcn/NEXT.md)
 
 ### PhxBringup build 59：VCN 固件仍未能启动（2026-11-22 暂停）
 

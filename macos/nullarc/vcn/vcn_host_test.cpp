@@ -416,6 +416,54 @@ static void testFirmwareHeader(const std::vector<unsigned char> &fw) {
     CHECK_EQ(size, 4u);
 }
 
+static void testSizedEncode() {
+    EncodeGeometry g;
+    CHECK(!sizedEncodeGeometry(961, 540, g));
+    CHECK(!sizedEncodeGeometry(960, 541, g));
+    CHECK(!sizedEncodeGeometry(UINT32_MAX, 128, g));
+    CHECK(!sizedEncodeGeometry(2562, 1440, g));
+    CHECK(!sizedEncodeGeometry(1920, 1920, g));
+    CHECK(!sizedEncodeGeometry(120, 144, g));
+    const uint32_t sizes[][2] = {{128,128}, {160,128}, {640,480}, {854,480}, {960,540},
+        {962,542}, {1280,720}, {1920,1080}, {2048,1152}, {2560,1440}, {1440,2560}};
+    for (const auto &size : sizes) {
+        CHECK(sizedEncodeGeometry(size[0], size[1], g));
+        CHECK_EQ(g.codedWidth, (size[0] + 15u) & ~15u);
+        CHECK_EQ(g.codedHeight, (size[1] + 15u) & ~15u);
+        CHECK_EQ(g.pitch % 256, 0u);
+        CHECK_EQ(g.inputOff, 3u * g.recLumaBytes);
+        CHECK(g.bitstreamOff >= g.inputOff + g.lumaBytes * 3u / 2u);
+        CHECK(g.bitstreamOff + g.bitstreamBytes <= g.feedbackOff);
+        CHECK(g.scratchBytes <= kEncodeScratchMax);
+        uint32_t words[kEncodeFrameMaxIbDw + 1]{};
+        words[kEncodeFrameMaxIbDw] = 0xdeadbeef;
+        buildEncodeFrameSessionIb(words, 0x8100000000u, 1, false, g);
+        CHECK_EQ(words[24], g.codedWidth);
+        CHECK_EQ(words[25], g.codedHeight);
+        CHECK_EQ(words[26], g.codedWidth - g.width);
+        CHECK_EQ(words[27], g.codedHeight - g.height);
+        uint32_t n = buildEncodeFrameIb(words, 0x8100000000u, 0x8200000000u, 0x8300000000u,
+                                        0x8400000000u, 0x8500000000u, 2, g);
+        CHECK(n && n <= kEncodeFrameMaxIbDw);
+        CHECK_EQ(words[kEncodeFrameMaxIbDw], 0xdeadbeefu);
+        uint32_t checksum = 0;
+        for (uint32_t i = 4; i < n; ++i) checksum += words[i];
+        CHECK_EQ(checksum, words[2]);
+    }
+    CHECK(sizedEncodeGeometry(962, 542, g));
+    std::vector<uint8_t> packed(phxnVcnPackedBytes(g.width, g.height), 97u);
+    std::fill(packed.begin() + g.width * g.height, packed.end(), 155u);
+    std::vector<uint8_t> dst(g.lumaBytes * 3u / 2u + 1u, 0xabu);
+    CHECK(copyPackedNv12ToEncodeFrame(dst.data(), dst.size()-1u, packed.data(), packed.size(), g));
+    CHECK_EQ(dst[g.width - 1u], 97u);
+    CHECK_EQ(dst[g.width], 16u);
+    CHECK_EQ(dst[g.height * g.pitch], 16u);
+    CHECK_EQ(dst[g.lumaBytes], 155u);
+    CHECK_EQ(dst[g.lumaBytes + g.width], 128u);
+    CHECK_EQ(dst[g.lumaBytes + (g.height / 2u) * g.pitch], 128u);
+    CHECK_EQ(dst.back(), 0xabu);
+}
+
 int main(int argc, char **argv) {
     testLayout();
     testDpgList();
@@ -425,6 +473,7 @@ int main(int argc, char **argv) {
     testEncodeSession();
     testEncodeFramePackets();
     testEncodeFrameBuffers();
+    testSizedEncode();
     const char *path = argc > 1 ? argv[1] : "/Users/Shared/gpu/fw/vcn_4_0_0.bin";
     bool ok = false;
     std::vector<unsigned char> fw = readFile(path, ok);
