@@ -1,5 +1,25 @@
 # 已知问题
 
+## Ghostty 1.4.0 启动闪退（已修复：`patches/nvmtl-env-no-mutation.patch`）
+
+现象：Ghostty 1.4.0 每次创建 surface 时退出，恢复窗口时也一样。旧 `NVMTLDriver` 日志会出现
+`conf: ... 2 inherited conf knob(s) forgotten first`。
+
+根因：Ghostty 1.4 在启动时缓存 `environ` 的指针和长度。Metal 插件是进程内延迟加载的；旧插件 constructor
+读取 `nvrm610.conf` 时调用 `unsetenv()` / `setenv()`，把宿主进程的环境数组缩短或搬走。Ghostty 随后在
+`defaultTermioEnv()` 中扫描旧切片，解引用空指针或失效指针而崩溃。问题不在 `CAMetalLayer`、`IOSurface` 或
+`nextDrawable`。
+
+修复：新增驱动内部的只读配置查询 `nvmtl_env_get()`，把 `nvrm610.conf` 保存在插件自己的静态表中；显式进程环境
+仍然优先。删除 constructor 和 Vulkan 初始化阶段的运行时 `setenv()` / `unsetenv()`，`NVRM_FLUSH_TIMEOUT_MS`
+也由内部查询提供。Chrome/Chromium 的 ANGLE 兼容开关是唯一保留的宿主环境写入，Ghostty 不会进入该路径。
+
+验证：2026-11-23 20:22–20:24 恢复旧驱动后，Ghostty 1.4.0 连续四次启动都生成新的 fatal 记录；20:26 安装修复版
+驱动后启动正常。20:32 双击确认可打开；20:37 重启后，20:58 再次打开正常，进程持续运行，`lsof` 确认映射新驱动。
+仓库补丁已在干净的 nullarc 0.4.0-alpha 源码上通过 `patch -p1` 和原生构建验证；回归测试
+`tests/nvmtl-env-no-mutation.sh` 确认加载插件前后 `environ` 指针与长度不变、conf 开关仍可读取。
+Ghostty 本体未做修改。
+
 ## 拖动窗口时画面撕裂（已修复：`macos/nullarc/4-dbuf.sh` + `macos/display`）
 
 快速拖动窗口时，窗口内容被横向切成两截，停下后立刻恢复。

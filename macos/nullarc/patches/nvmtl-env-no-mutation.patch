@@ -1,0 +1,228 @@
+--- a/src/nmplugin/NVMTLDevice.m
++++ b/src/nmplugin/NVMTLDevice.m
+@@ -23,6 +23,100 @@
+ #include "nvmtl_sample_positions.h"
+ #include "nvmtl_log_failure.h"
+ #include <sys/sysctl.h>
++
++/*
++ * Keep nvrm610.conf out of the host process environment.
++ *
++ * Metal plugins are loaded lazily, after the host application has already
++ * started.  Calling setenv()/unsetenv() here can reallocate or shorten
++ * environ, invalidating a host that cached the previous pointer and length.
++ * Ghostty 1.4.0 does exactly that and then crashes while building the child
++ * terminal environment.  Resolve driver knobs through this read-only wrapper
++ * instead; an explicitly set process variable still wins over the file.
++ */
++#define NVMTL_CONF_MAX 128
++typedef struct {
++    char *key;
++    char *value;
++} nvmtl_conf_entry;
++static nvmtl_conf_entry g_nvmtl_conf[NVMTL_CONF_MAX];
++static size_t g_nvmtl_conf_count;
++static pthread_once_t g_nvmtl_conf_once = PTHREAD_ONCE_INIT;
++
++static int nvmtl_conf_wanted(const char *key) {
++    return key &&
++        (!strncmp(key, "NVMTL_", 6) || !strncmp(key, "NVK_", 4) ||
++         !strncmp(key, "NAK_", 4) || !strncmp(key, "NVRM_", 5));
++}
++
++static void nvmtl_conf_load(void) {
++    FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
++    if (!f) return;
++
++    char line[512];
++    while (fgets(line, sizeof line, f)) {
++        char *p = line;
++        while (*p == ' ' || *p == '\t') p++;
++        if (*p == '#' || *p == '\n' || !*p) continue;
++
++        char *eq = strchr(p, '=');
++        if (!eq) continue;
++        *eq = 0;
++        char *key = p;
++        char *val = eq + 1;
++
++        char *end = key + strlen(key);
++        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
++        end = val + strlen(val);
++        while (end > val && (end[-1] == '\n' || end[-1] == '\r' ||
++                             end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
++
++        if (!nvmtl_conf_wanted(key) || !strcmp(key, "NVMTL_CONF_SET")) continue;
++        if (g_nvmtl_conf_count >= NVMTL_CONF_MAX) {
++            syslog(LOG_WARNING, "NullMoth: conf: too many knobs in nvrm610.conf, ignoring the rest");
++            break;
++        }
++
++        char *copy_key = strdup(key);
++        char *copy_val = strdup(val);
++        if (!copy_key || !copy_val) {
++            free(copy_key);
++            free(copy_val);
++            continue;
++        }
++        g_nvmtl_conf[g_nvmtl_conf_count++] = (nvmtl_conf_entry){
++            .key = copy_key,
++            .value = copy_val,
++        };
++    }
++    fclose(f);
++}
++
++/* Read the real process environment only.  Later code uses this for variables
++ * that an external library must see, rather than the plugin's config overlay. */
++static const char *nvmtl_process_getenv(const char *name) {
++    return name ? getenv(name) : NULL;
++}
++
++const char *nvmtl_env_get(const char *name) {
++    if (!name || !*name) return NULL;
++
++    const char *current = getenv(name);
++    if (current) return current;
++    if (!strcmp(name, "NVMTL_CONF_SET")) return NULL;
++
++    pthread_once(&g_nvmtl_conf_once, nvmtl_conf_load);
++    for (size_t i = 0; i < g_nvmtl_conf_count; i++) {
++        if (!strcmp(name, g_nvmtl_conf[i].key)) return g_nvmtl_conf[i].value;
++    }
++    return NULL;
++}
++
++/* All plugin source is one translation unit, so this also covers the included
++ * NVMTL*.m and nvmtl_vk.c files.  Config propagation must not touch the host
++ * process environment; the Chrome/ANGLE override below is the sole exception. */
++#define getenv(name) nvmtl_env_get(name)
++
+ #ifndef NVMTL_RELEASE
+ #define NVMTL_RELEASE 0
+ #endif
+@@ -468,12 +562,16 @@
+ }
+ __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
+ {
+-    const char *opt = getenv("NVMTL_ANGLE_METAL");
++    /* This is the one deliberate host-environment write left in the plugin.
++     * ANGLE reads this before it creates its Metal backend in Chrome's GPU
++     * process, and the env is the only supported override.  Keep it confined
++     * to Chrome/Chromium; Ghostty and ordinary Metal apps never reach it. */
++    const char *opt = nvmtl_process_getenv("NVMTL_ANGLE_METAL");
+     if (opt && !strcmp(opt, "0")) return;
+     const char *me = getprogname();
+     if (!(opt && !strcmp(opt, "1")) && !nvmtl_angle_chrome_family()) return;
+     const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
+-    const char *cur = getenv(key);
++    const char *cur = nvmtl_process_getenv(key);
+     if (cur && strstr(cur, rule)) return;
+     // One line per process, outside nvlog's release failure filter: a field report must show whether the rule was
+     // active in this process.
+--- a/src/nmplugin/NVMTLObjects.m
++++ b/src/nmplugin/NVMTLObjects.m
+@@ -79,53 +79,6 @@
+ static void nvmtl_res2_note_use(NVMTLTexture *t);
+ static uint64_t nvmtl_res2_evict(uint64_t want);
+ extern uint64_t (*nvmtl_res2_evict_hook)(uint64_t want);
+-__attribute__((constructor)) static void nvmtl_conf_knobs(void)
+-{
+-#if NVMTL_RELEASE
+-    { extern char **environ; char *names[256]; unsigned n = 0;
+-      for (char **e = environ; e && *e && n < 256; e++)
+-          if (!strncmp(*e, "NVMTL_", 6) || !strncmp(*e, "NVK_", 4) || !strncmp(*e, "NAK_", 4) || !strncmp(*e, "NVRM_", 5)) {
+-              const char *eq = strchr(*e, '='); if (!eq) continue;
+-              names[n] = strndup(*e, (size_t)(eq - *e)); if (names[n]) n++; }
+-      for (unsigned i = 0; i < n; i++) { unsetenv(names[i]); free(names[i]); } }
+-#endif
+-    unsigned forgot = 0;
+-    { const char *rec = getenv("NVMTL_CONF_SET");
+-      if (rec && *rec) { char *dup = strdup(rec), *save = NULL;
+-          for (char *kv = dup ? strtok_r(dup, ";", &save) : NULL; kv; kv = strtok_r(NULL, ";", &save)) {
+-              char *eq = strchr(kv, '='); if (!eq) continue; *eq = 0;
+-              const char *now = getenv(kv);
+-              if (now && !strcmp(now, eq + 1)) { unsetenv(kv); forgot++; }
+-          }
+-          free(dup); }
+-      unsetenv("NVMTL_CONF_SET"); }
+-    char recbuf[2048]; size_t recn = 0; recbuf[0] = 0;
+-    FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
+-    if (!f) { if (forgot) nvlog("conf: forgot %u inherited knob(s); no conf file", forgot); return; }
+-    char line[512];
+-    unsigned took = 0;
+-    while (fgets(line, sizeof line, f)) {
+-        char *p = line;
+-        while (*p == ' ' || *p == '\t') p++;
+-        if (*p == '#' || *p == '\n' || !*p) continue;
+-        char *eq = strchr(p, '=');
+-        if (!eq) continue;
+-        *eq = 0;
+-        char *key = p, *val = eq + 1;
+-        char *end = key + strlen(key);
+-        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+-        end = val + strlen(val);
+-        while (end > val && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+-        if (strncmp(key, "NVMTL_", 6) && strncmp(key, "NVK_", 4) && strncmp(key, "NVRM_", 5)) continue;
+-        if (getenv(key)) continue;
+-        if (setenv(key, val, 0) == 0) { took++;
+-            int k = snprintf(recbuf + recn, sizeof recbuf - recn, "%s%s=%s", recn ? ";" : "", key, val);
+-            if (k > 0 && (size_t)k < sizeof recbuf - recn) recn += (size_t)k; else recbuf[recn] = 0; }
+-    }
+-    fclose(f);
+-    if (recn) setenv("NVMTL_CONF_SET", recbuf, 1);
+-    if (took || forgot) nvlog("conf: %u knob(s) read from /Library/GPUBundles/nvmtl/nvrm610.conf, %u inherited conf knob(s) forgotten first (the environment still wins)", took, forgot);
+-}
+ static int nvmtl_dontcare_clears(void) {
+     static int on = -1;
+     if (on < 0) { const char *e = getenv("NVMTL_DONTCARE_CLEARS"); on = (e && *e && *e != '0') ? 1 : 0; }
+--- a/src/nmplugin/nvmtl_vk.c
++++ b/src/nmplugin/nvmtl_vk.c
+@@ -690,23 +695,14 @@
+ {
+     if (g_state) return g_state == 1 ? 0 : -1;
+     g_state = -1;
+-    if (!getenv("NVRM_FLUSH_TIMEOUT_MS")) {
+-        char budget[32]; snprintf(budget, sizeof budget, "%ld", nvmtl_gpu_wait_budget_ms());
+-        setenv("NVRM_FLUSH_TIMEOUT_MS", budget, 1);
+-        nvlog("vk: GPU wait budget %s ms for %s (WindowServer keeps 5000 - a frozen desktop is worse than a dropped frame)", budget, getprogname());
+-    }
+-    if (!getenv("MESA_SHADER_CACHE_DIR") && !getenv("XDG_CACHE_HOME") && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
++    /* Do not export driver defaults with setenv here.  This runs after a host
++     * such as Ghostty has cached environ.  nvmtl_env_get() applies
++     * NVRM_FLUSH_TIMEOUT_MS from the environment or nvrm610.conf internally. */
++    if (!getenv("MESA_SHADER_CACHE_DIR") && !getenv("XDG_CACHE_HOME") &&
++        !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
+         const char *home = getenv("HOME");
+-        if (!home || access(home, W_OK) != 0) {
+-            char ucd[PATH_MAX], dir[PATH_MAX];
+-            const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
+-            if (n > 0 && n <= sizeof ucd && snprintf(dir, sizeof dir, "%snvmtl-mesa", ucd) < (int)sizeof dir) {
+-                mkdir(dir, 0700);
+-                if (access(dir, W_OK) == 0) { setenv("MESA_SHADER_CACHE_DIR", dir, 1);
+-                    nvlog("vk: %s has no writable HOME (%s) - Mesa shader disk cache at %s", getprogname(), home ?: "unset", dir); }
+-                else nvlog("vk: %s: no writable Mesa cache dir (%s) - NAK recompiles every start", getprogname(), dir);
+-            }
+-        }
++        if (!home || access(home, W_OK) != 0)
++            nvlog("vk: no writable HOME; Mesa shader disk cache stays unavailable (host environment is not modified)");
+     }
+     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
+     if (g_lib) {
+@@ -737,12 +733,14 @@
+         nvlog("vk: dlopen(%s): %s", NVMTL_ICD_LIB, dlerror());
+     }
+     if (!pvkGetInstanceProcAddr) {
+-        if (!getenv("VK_ICD_FILENAMES")) setenv("VK_ICD_FILENAMES", NVMTL_ICD, 1);
++        /* The loader must be able to discover an ICD without this plugin
++         * rewriting the host environment.  Prefer the direct ICD above; use
++         * the loader fallback only when its manifest search is already set up. */
+         g_lib = dlopen(NVMTL_LOADER, RTLD_NOW | RTLD_LOCAL);
+         if (!g_lib) { nvlog("vk: dlopen(%s): %s", NVMTL_LOADER, dlerror()); return -1; }
+         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
+         if (!pvkGetInstanceProcAddr) { nvlog("vk: no vkGetInstanceProcAddr"); return -1; }
+-        nvlog("vk: fell back to the loader at %s", NVMTL_LOADER);
++        nvlog("vk: fell back to the loader at %s (expects an explicit Vulkan ICD manifest)", NVMTL_LOADER);
+     }
+     pvkCreateInstance = (PFN_vkCreateInstance)pvkGetInstanceProcAddr(NULL, "vkCreateInstance");
+     if (!pvkCreateInstance) { nvlog("vk: no vkCreateInstance"); return -1; }
