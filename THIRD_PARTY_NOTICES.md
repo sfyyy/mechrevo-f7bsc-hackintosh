@@ -103,8 +103,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-This license covers only original documentation, helper scripts, and
-configuration arrangement authored for this repository. Third-party components
-are governed by their own upstream licenses; see THIRD_PARTY_NOTICES.md.
 ```
+
+上述许可证适用于来自 bbbbrt 的 XhciNudge 与 AppleMCEReporterDisabler。本仓库原创文档、脚本和配置采用根目录
+[LICENSE](LICENSE) 中的 MIT License；所有第三方组件继续遵循各自上游许可证。

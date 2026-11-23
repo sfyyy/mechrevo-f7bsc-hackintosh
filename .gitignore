@@ -3,6 +3,7 @@ smbios.private.json
 # EFI archives written by linux/deploy-efi.sh
 backups/
 .DS_Store
+macos/nullarc/vcn/results/
 # not redistributable: download separately (README)
 EFI/OC/Kexts/AMFIPass.kext/
 EFI/OC/Kexts/SimpleHDA.kext/

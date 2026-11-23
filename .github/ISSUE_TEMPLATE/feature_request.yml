@@ -1,0 +1,45 @@
+name: Feature request / 功能建议
+description: Propose a reproducible feature, optimization or documentation improvement.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 要解决的问题
+      description: What user-facing problem or documentation gap does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal / 建议方案
+      description: Describe the behavior, interface or documentation change you want.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria / 验收标准
+      description: What measurable result proves the feature works?
+      placeholder: "Example: keyframe latency below 10 ms with zero frame errors"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / 模块
+      options:
+        - Documentation / 文档
+        - Installation and recovery / 安装与恢复
+        - Display / 显示
+        - Video and VCN / 视频与 VCN
+        - Performance and thermal / 性能与温控
+        - Hardware support / 硬件支持
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and rollback / 风险与回退
+      description: Could this affect boot, data, thermals or unsupported hardware?

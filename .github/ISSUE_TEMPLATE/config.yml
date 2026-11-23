@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation guide / 安装指南
+    url: https://github.com/sfyyy/mechrevo-f7bsc-hackintosh/blob/main/docs/INSTALL.md
+    about: Read the supported scope, prerequisites and recovery steps before opening an issue.
+  - name: Known issues / 已知问题
+    url: https://github.com/sfyyy/mechrevo-f7bsc-hackintosh/blob/main/docs/known-issues.md
+    about: Search the detailed issue history and test evidence first.

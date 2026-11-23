@@ -48,8 +48,8 @@ mark。旧的无编号 ready 仍保留兼容语义。代码位于：
 - 可复用补丁：`macos/nullarc/patches/phxaccel-surface-marks.patch`、`macos/nullarc/patches/nvmtl-surface-marks.patch`
 - 单元测试：`macos/nullarc/tests/test-surface-mark-seq.py`
 
-**尚未安装/重启验证**。一键安装器：`/Users/sfyyy/Documents/apple/work/install-surface-marks.command`（会备份、
-校验并安装三者，不自动重启）；回滚器：`rollback-surface-marks.command`。候选 kext 和插件均已原生编译；
+**尚未安装/重启验证**。本机实验用的一键安装器未纳入仓库（会备份、校验并安装三者，不自动重启）；
+对应回滚器为 `rollback-surface-marks.command`。候选 kext 和插件均已原生编译；
 `test-surface-mark-seq.py` 验证了“后续 mark 不延长等待”、
 超时只清理旧 mark、512 槽和序号回绕。`wsnowait`、`surftest`、`desctest`、`carender` 在未安装插件路径下通过。
 验证通过后，`phxdisplay.sh` 才能把 `debug.nvaccel_surface_gpu_on` 改回 1，并删除 `NVMTL_WS_WAIT_COMPLETION=1`

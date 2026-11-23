@@ -1,0 +1,78 @@
+name: Bug report / 问题报告
+description: Report a reproducible hardware, boot, display, media or documentation issue.
+title: "[Bug] "
+labels: ["bug", "status/needs-testing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Remove SMBIOS serials, UUIDs, MLB values, Apple account data and personal paths before submitting.
+        This project currently supports only the MECHREVO F7BSC reference configuration.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and hardware revision / 机器与硬件批次
+      description: Exact model, CPU, GPU, RAM and any known board revision.
+      placeholder: MECHREVO F7BSC, Ryzen 7 7840H, Radeon 780M
+    validations:
+      required: true
+  - type: input
+    id: bios
+    attributes:
+      label: BIOS version / BIOS 版本
+      placeholder: "Example: 1.xx"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS and build / macOS 与 build
+      placeholder: macOS 26.7.1 (25G241)
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Project and driver versions / 项目与驱动版本
+      description: Commit, OpenCore, nullarc and PhxBringup versions.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / 复现步骤
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs / 实际行为与日志
+      description: Paste relevant output. Redact private values.
+    validations:
+      required: true
+  - type: dropdown
+    id: recovery
+    attributes:
+      label: Recovery tested? / 是否测试过恢复？
+      options:
+        - "Yes / 是"
+        - "No / 否"
+        - "Not applicable / 不适用"
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation / 确认
+      options:
+        - label: I removed SMBIOS credentials, personal data and non-redistributable files. / 我已移除 SMBIOS 凭据、个人数据和不可再分发文件。
+          required: true
+        - label: I understand this is an experimental same-model project. / 我了解这是同型号实验性项目。
+          required: true

@@ -154,7 +154,7 @@ DPG 端口在门控下读回全 `0xffffffff`（正常）。这条路要真正可
 
 ## 常用命令
 ```
-cd /Users/sfyyy/Documents/apple/work/vcntest
+cd <workspace>/vcntest
 sudo ./install.sh                      # 装进 OpenCore，重启生效
 sudo ./vcnctl status                   # VCN 状态
 sudo ./vcnctl init <fw>                # 静态非 DPG 路径
