@@ -24,7 +24,7 @@ done
 BUILD=$(ioreg -r -l -c PhxBringup -d 1 | awk -F'= ' '/"phx-build"/{print $2; exit}')
 echo "== PhxBringup build: ${BUILD:-<not loaded>}"
 case "$BUILD" in
-    38|62|63|64|65|66|67|68) ;;
+    38|62|63|64|65|66|67|68|75|76|78|79) ;;
     60|61) C="$(cd "$(dirname "$0")" && pwd)/vcntest/vcnctl" ;;
     *) echo "This test requires PhxBringup build 38 or 60 through 68. Loaded: ${BUILD:-unknown}."; exit 1 ;;
 esac

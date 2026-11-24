@@ -30,7 +30,32 @@ esac
 EOF
 cat > "$SIM/bin/ioreg" <<'EOF'
 #!/bin/bash
+if [ "${1:-}" = -rc ] && [ "${2:-}" = PhxAMDFB ]; then
+    printf '    | |   <class PhxAMDFB>\n'
+    exit 0
+fi
 printf '    | | |   "phx-build" = %s\n' "${SIM_BUILD:-38}"
+EOF
+cat > "$SIM/bin/kmutil" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+  print-diagnostics) echo 'Dependencies: OK' ;;
+  showloaded) printf '%s\n' 'org.drip.PhxBringup' 'com.luuumi.PhxAccel' ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$SIM/bin/system_profiler" <<'EOF'
+#!/bin/bash
+[ "${SIM_METAL_FAIL:-0}" = 0 ] || exit 1
+printf '%s\n' '{"SPDisplaysDataType":[{"spdisplays_mtlgpufamilysupport":"spdisplays_metal3"}]}'
+EOF
+cat > "$SIM/bin/nvram" <<'EOF'
+#!/bin/bash
+printf '%s\t%s\n' phxfb-boot 1
+EOF
+cat > "$SIM/bin/sysctl" <<'EOF'
+#!/bin/bash
+echo 100
 EOF
 printf '#!/bin/bash\nexit 0\n' > "$SIM/bin/shutdown"
 chmod +x "$SIM/bin/"*
@@ -70,6 +95,8 @@ if [ -f "$BRINGUP_SRC" ]; then
 else
     printf '%s\n' 'echo "== AUTOLOAD_RLC =="' > "$SIM/fakegpu/bringup5.sh"
 fi
+touch "$SIM/fakegpu/phxboot-m2"
+printf '%s\n' 'done simulated boot' > "$SIM/fakegpu/phxboot.log"
 rewrite "$WORK/install-vcn.sh" "$SIM" "$SIM/fakegpu" "$SIM/install.sh"
 rewrite "$WORK/rollback-vcn.sh" "$SIM" "$SIM/fakegpu" "$SIM/rollback.sh"
 chmod +x "$SIM/install.sh" "$SIM/rollback.sh"
@@ -116,6 +143,10 @@ for op in decode-frame encode-frame; do
 done
 
 bash "$SIM/install.sh" --dry-run >/dev/null || fail "install --dry-run"
+if SIM_METAL_FAIL=1 bash "$SIM/install.sh" --dry-run >/dev/null 2>&1; then
+    fail "install allowed deployment without Metal 3"
+fi
+[ -f "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext/Contents/OLD_MARKER" ] || fail "Metal 3 preflight changed the EFI kext"
 bash "$SIM/install.sh" >/dev/null || fail "install"
 cmp -s "$SIM/PhxBringup-vcn.kext/Contents/MacOS/PhxBringup" "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext/Contents/MacOS/PhxBringup" || fail "installed binary differs"
 [ -f "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext/Contents/OLD_MARKER" ] && fail "old kext not replaced"
@@ -126,6 +157,7 @@ BK=$(cat "$SIM/fakegpu/backup/vcn-latest")
 [ "$(grep -c vcn-fw-at-boot "$SIM/fakegpu/bringup5.sh")" = 1 ] || fail "boot block not inserted exactly once"
 bash "$SIM/rollback.sh" >/dev/null || fail "rollback"
 [ -f "$SIM/esp/EFI/OC/Kexts/PhxBringup.kext/Contents/OLD_MARKER" ] || fail "rollback did not restore the old kext"
+[ "$(grep -c vcn-fw-at-boot "$SIM/fakegpu/bringup5.sh")" = 0 ] || fail "rollback did not restore bringup5.sh"
 [ ! -e "$SIM/state/mounted" ] || fail "ESP left mounted after rollback"
 bash "$SIM/install.sh" >/dev/null || fail "second install"
 [ "$(grep -c vcn-fw-at-boot "$SIM/fakegpu/bringup5.sh")" = 1 ] || fail "boot block duplicated"
@@ -163,7 +195,7 @@ grep -q '^CALL down' "$SIM/calls.log" || fail "power down not called"
 rm -f "$SIM/calls.log"; SIM_BUILD=61 bash "$SIM/vcn-test.sh" >/dev/null || fail "build 61 session tests"
 grep -q '^CALL decode-session' "$SIM/calls.log" || fail "decode-session missing"
 grep -q '^CALL encode-session' "$SIM/calls.log" || fail "encode-session missing"
-for build in 62 63 64 65 66 67 68; do
+for build in 62 63 64 65 66 67 68 75 76 78; do
     rm -f "$SIM/calls.log"
     SIM_BUILD="$build" bash "$SIM/vcn-test.sh" >/dev/null || fail "build $build frames"
     for op in decode-frame encode-frame; do

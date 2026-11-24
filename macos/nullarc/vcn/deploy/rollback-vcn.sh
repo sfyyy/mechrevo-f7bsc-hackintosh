@@ -36,9 +36,16 @@ mkdir -p "$CUR"
 ditto --norsrc --noextattr --noacl "$DEST" "$CUR/PhxBringup.kext"
 rm -rf "$DEST"
 ditto --norsrc --noextattr --noacl "$BK/PhxBringup.kext" "$DEST"
-chmod -R 755 "$DEST"
 cmp "$BK/PhxBringup.kext/Contents/MacOS/PhxBringup" "$DEST/Contents/MacOS/PhxBringup" || { echo "restore failed"; exit 1; }
 sync
 diskutil unmount "/dev/$ID" >/dev/null 2>&1 || true
+if [ -f "$BK/bringup5.sh" ]; then
+    BRINGUP="$G/bringup5.sh"
+    [ -f "$BRINGUP" ] || { echo "$BRINGUP is missing; refusing to restore an unrelated boot script"; exit 1; }
+    cp -p "$BRINGUP" "$CUR/bringup5.sh"
+    cp -p "$BK/bringup5.sh" "$BRINGUP"
+    cmp -s "$BK/bringup5.sh" "$BRINGUP" || { echo "bringup5.sh restore failed"; exit 1; }
+    echo "restored $BRINGUP"
+fi
 echo "restored $BK/PhxBringup.kext to $DEST (previous current kept in $CUR)"
 echo "reboot to load it"

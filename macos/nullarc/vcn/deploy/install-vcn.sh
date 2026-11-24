@@ -22,6 +22,40 @@ ESP_ARG=""
 say() { echo "== $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+check_graphics_health() {
+    local loaded display_data
+    [ ! -e "$G/phxboot-off" ] || die "GPU kill switch exists at $G/phxboot-off; restore desktop acceleration and reboot first"
+    [ ! -e /var/db/phxboot.pending ] || die "phxboot has an unfinished startup attempt; resolve it and reboot before installing"
+    [ -e "$G/phxboot-m2" ] || die "WindowServer GPU compositing is not armed ($G/phxboot-m2 is missing)"
+    nvram -p | awk '$1 == "phxfb-boot" && $2 == "1" { found=1 } END { exit !found }' ||
+        die "NVRAM phxfb-boot is not armed; restore desktop acceleration and reboot first"
+    [ -f /var/log/phxboot.log ] && tail -n 1 /var/log/phxboot.log | grep -q '^done ' ||
+        die "the latest phxboot run did not finish successfully"
+    ioreg -rc PhxAMDFB -d 0 | grep -q 'class PhxAMDFB' ||
+        die "PhxAMDFB is not active; refusing to replace the graphics bring-up kext"
+    sysctl -n debug.nvaccel_iop_ok 2>/dev/null | awk '$1 > 0 { found=1 } END { exit !found }' ||
+        die "the GPU has not completed a desktop frame; refusing to replace the graphics bring-up kext"
+    loaded=$(kmutil showloaded --list-only 2>/dev/null) || die "cannot inspect loaded kernel extensions"
+    printf '%s\n' "$loaded" | grep -q 'org.drip.PhxBringup' || die "PhxBringup is not loaded"
+    printf '%s\n' "$loaded" | grep -q 'com.luuumi.PhxAccel' || die "PhxAccel is not loaded"
+    display_data=$(system_profiler SPDisplaysDataType -json 2>/dev/null) ||
+        die "cannot inspect Metal support"
+    printf '%s\n' "$display_data" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    supported = any(
+        display.get("spdisplays_mtlgpufamilysupport") == "spdisplays_metal3"
+        for item in data.get("SPDisplaysDataType", [])
+        for display in [item]
+    )
+except (ValueError, TypeError):
+    supported = False
+sys.exit(0 if supported else 1)
+' || die "System Information does not report Metal 3; refusing to replace the graphics bring-up kext"
+    say "graphics health verified: PhxBringup, PhxAccel, PhxAMDFB and Metal 3"
+}
+
 install_tool() (
     say "building vcnctl"
     tool=$(mktemp "$G/.vcnctl.XXXXXX")
@@ -52,6 +86,7 @@ BID=$(plutil -extract CFBundleIdentifier raw -o - "$SRC/Contents/Info.plist")
 [ "$BID" = "org.drip.PhxBringup" ] || die "unexpected bundle identifier $BID"
 file "$SRC/Contents/MacOS/PhxBringup" | grep -q 'kext bundle x86_64' || die "not an x86_64 kext binary"
 say "candidate kext: $SRC ($(shasum -a 256 "$SRC/Contents/MacOS/PhxBringup" | cut -c1-16)...)"
+check_graphics_health
 say "checking kernel-visible dependencies"
 DIAG=$(kmutil print-diagnostics --bundle-path "$SRC" 2>&1 || true)
 echo "$DIAG" | grep -q 'Dependencies: OK' || { echo "$DIAG"; die "kmutil could not resolve the kext dependencies"; }
@@ -116,6 +151,17 @@ done
 DEST="$TARGET_MP/EFI/OC/Kexts/PhxBringup.kext"
 say "OpenCore ESP: /dev/$TARGET_ID mounted at $TARGET_MP"
 say "replacing $DEST"
+python3 - "$DEST/Contents/Info.plist" "$SRC/Contents/Info.plist" <<'PY' || die "candidate kext changes graphics matching metadata"
+import plistlib, sys
+keys = ("CFBundleIdentifier", "IOClass", "IOMatchCategory", "IOProviderClass",
+        "IOUserClientClass", "IOPCIMatch")
+def personality(path):
+    with open(path, "rb") as stream:
+        plist = plistlib.load(stream)
+    return (plist["CFBundleIdentifier"],
+            {key: plist["IOKitPersonalities"]["PhxBringup"].get(key) for key in keys[1:]})
+sys.exit(0 if personality(sys.argv[1]) == personality(sys.argv[2]) else 1)
+PY
 if [ $DRY = 1 ]; then
     say "dry run: nothing written"
     [ -z "$(mount_point "$TARGET_ID")" ] || diskutil unmount "/dev/$TARGET_ID" >/dev/null 2>&1 || true
