@@ -1,0 +1,131 @@
+// Neural-network inference is kept off this GPU by hiding the GPU from the inference stack only (2026-11-20).
+//
+// nvmtl_nn_library() refuses Espresso's and MPSNeuralNetwork's metallibs (B-15: those kernels hang the 780M). The
+// frameworks do not fall back on a nil library: MPSCore asserts (MPSDeviceComputePipelineState.mm:60) and the app
+// aborts. Vision's barcode and text requests reach that assert in any app that runs them in-process (QQ's QR scanner,
+// Shottr's OCR), even with usesCPUOnly, because Espresso registers MPS kernels while building a CPU plan too.
+//
+// So instead of the whole process going without Metal (the allow-list's "-App" lines), the inference stack is shown
+// no GPU and plans on the CPU; the app's own Metal, CoreImage and everything else still get the device.
+//  1. CoreML's GPU registry, the list MLAllComputeDevices() and so Vision (VNComputeDeviceUtilities) choose from, holds
+//     no GPU: -[MLGPUComputeDeviceRegistry registeredComputeDevices] answers no devices (when the registry was built
+//     before this plugin loaded), and the registry's MTLCopyAllDevicesWithObserver call from CoreML gets an empty list
+//     (when CoreML is loaded later: its classes are not registered yet when dyld reports the image, so the method is
+//     replaced from that call instead). Only that one lookup is hidden from CoreML.
+//  2. Espresso's own device lookups (MTLCreateSystemDefaultDevice, MTLCopyAllDevices, MPSGetPreferredDevice) answer
+//     none. Their pointers sit in the shared cache's uniqued GOT, one slot per symbol for every dylib, so the slot gets
+//     a wrapper that answers "none" only when the return address is inside Espresso and calls the real function for
+//     everyone else. Found through Espresso's own __stubs (jmp *slot(%rip)), installed when Espresso loads.
+// Limit: a lookup made before this plugin loaded (the plugin loads inside the process's first device enumeration)
+// is not seen; the library refusal still stands behind it. NVMTL_ALLOW_NN=1 turns all of this off.
+// Verified on 25G241 x86_64: Vision QR (VNDetectBarcodesRequest) and OCR (VNRecognizeTextRequest, also usesCPUOnly)
+// return results instead of aborting; Vision's other Metal use and the app's device are unchanged.
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+
+#define NVMTL_NNH_IMAGES 4
+enum { NNH_COPY_ALL = 1, NNH_DEFAULT = 2, NNH_PREFERRED = 4, NNH_OBSERVER = 8 };
+static struct { const uint8_t *lo, *hi; unsigned hide; } g_nnh_img[NVMTL_NNH_IMAGES];
+static _Atomic int g_nnh_nimg;
+static void *(*g_nnh_real_copy_all)(void), *(*g_nnh_real_default)(void), *(*g_nnh_real_preferred)(unsigned long);
+static void *(*g_nnh_real_observer)(void **, void *);
+static _Atomic unsigned long g_nnh_hidden;
+
+static int nvmtl_nnh_from_hidden(const void *ra, unsigned fn) {
+    const int n = atomic_load(&g_nnh_nimg);
+    for (int i = 0; i < n; i++)
+        if ((g_nnh_img[i].hide & fn) && (const uint8_t *)ra >= g_nnh_img[i].lo && (const uint8_t *)ra < g_nnh_img[i].hi) {
+            if (atomic_fetch_add(&g_nnh_hidden, 1) == 0) nvlog("nn-hide: the inference stack asked for a Metal device - answered none, it plans on the CPU");
+            return 1;
+        }
+    return 0;
+}
+static void nvmtl_nnh_coreml(void);
+// Plain C on purpose: these stand in for C functions that return +1 (Copy, Create) or +0 (Get) references, and ARC
+// must not add or drop a retain on the way through.
+__attribute__((noinline)) static void *nvmtl_nnh_copy_all(void) {
+    if (nvmtl_nnh_from_hidden(__builtin_return_address(0), NNH_COPY_ALL)) return (void *)CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+    return g_nnh_real_copy_all();
+}
+__attribute__((noinline)) static void *nvmtl_nnh_default(void) {
+    if (nvmtl_nnh_from_hidden(__builtin_return_address(0), NNH_DEFAULT)) return NULL;
+    return g_nnh_real_default();
+}
+__attribute__((noinline)) static void *nvmtl_nnh_preferred(unsigned long opts) {
+    if (nvmtl_nnh_from_hidden(__builtin_return_address(0), NNH_PREFERRED)) return NULL;
+    return g_nnh_real_preferred(opts);
+}
+// CoreML's registry keeps the observer token to remove it later, so the real call still registers it; only the list
+// handed back is empty.
+__attribute__((noinline)) static void *nvmtl_nnh_observer(void **observer, void *handler) {
+    const void *ra = __builtin_return_address(0);
+    void *devices = g_nnh_real_observer(observer, handler);
+    if (!nvmtl_nnh_from_hidden(ra, NNH_OBSERVER)) return devices;
+    if (devices) CFRelease((CFTypeRef)devices);
+    nvmtl_nnh_coreml();   // CoreML's classes are registered by now
+    return (void *)CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+}
+static int nvmtl_nnh_patch_slot(void **slot, void *to) {
+    if (vm_protect(mach_task_self(), (vm_address_t)slot, sizeof *slot, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)) return 0;
+    __atomic_store_n(slot, to, __ATOMIC_RELEASE);
+    vm_protect(mach_task_self(), (vm_address_t)slot, sizeof *slot, FALSE, VM_PROT_READ);
+    return 1;
+}
+// Records the image's __TEXT as a hidden caller for the functions in `hide`, then points the GOT slots its stubs jump
+// through for those functions at the wrappers.
+static void nvmtl_nnh_patch_image(const struct mach_header_64 *mh, const char *name, unsigned hide) {
+    if (!g_nnh_real_preferred) g_nnh_real_preferred = dlsym(RTLD_DEFAULT, "MPSGetPreferredDevice");   // Espresso links MPS
+    unsigned long tsz = 0, ssz = 0;
+    const uint8_t *text = getsegmentdata(mh, "__TEXT", &tsz), *st = getsectiondata(mh, "__TEXT", "__stubs", &ssz);
+    const int i = atomic_load(&g_nnh_nimg);
+    if (!text || !st || i >= NVMTL_NNH_IMAGES) { nvlog("nn-hide: %s has no __TEXT/__stubs to patch", name); return; }
+    g_nnh_img[i].lo = text; g_nnh_img[i].hi = text + tsz; g_nnh_img[i].hide = hide;
+    atomic_store(&g_nnh_nimg, i + 1);   // the range is live before any slot points at a wrapper
+    void *from[4] = { (void *)g_nnh_real_copy_all, (void *)g_nnh_real_default, (void *)g_nnh_real_preferred, (void *)g_nnh_real_observer };
+    void *to[4] = { (void *)nvmtl_nnh_copy_all, (void *)nvmtl_nnh_default, (void *)nvmtl_nnh_preferred, (void *)nvmtl_nnh_observer };
+    unsigned done = 0;
+    for (unsigned long o = 0; o + 6 <= ssz; o += 6) {          // x86_64 stub: ff 25 <rel32>  jmp *slot(%rip)
+        if (st[o] != 0xff || st[o + 1] != 0x25) continue;
+        void **slot = (void **)(st + o + 6 + *(const int32_t *)(st + o + 2));
+        for (int k = 0; k < 4; k++) {
+            if (!(hide & (1u << k))) continue;
+            if (*slot == to[k] || (from[k] && *slot == from[k] && nvmtl_nnh_patch_slot(slot, to[k]))) done |= 1u << k;
+        }
+    }
+    nvlog("nn-hide: %s device lookups %s (wanted 0x%x, hidden 0x%x: 1 MTLCopyAllDevices, 2 MTLCreateSystemDefaultDevice, "
+          "4 MPSGetPreferredDevice, 8 MTLCopyAllDevicesWithObserver)", name, done == hide ? "hidden" : "PARTLY hidden", hide, done);
+}
+static id nvmtl_nnh_no_gpus(id self, SEL _cmd) { return @[]; }
+static void nvmtl_nnh_coreml(void) {
+    static _Atomic int done;
+    if (atomic_load(&done)) return;
+    Class c = objc_lookUpClass("MLGPUComputeDeviceRegistry");
+    Method m = c ? class_getInstanceMethod(c, sel_registerName("registeredComputeDevices")) : NULL;
+    if (!m) return;   // CoreML just loaded: its registry call is hidden instead, and comes back here
+    if (atomic_exchange(&done, 1)) return;
+    method_setImplementation(m, (IMP)nvmtl_nnh_no_gpus);
+    nvlog("nn-hide: CoreML/Vision compute devices: GPU withdrawn, inference plans on the CPU");
+}
+static void nvmtl_nnh_image(const struct mach_header *mh, intptr_t slide) {
+    Dl_info di;
+    if (!dladdr(mh, &di) || !di.dli_fname) return;
+    const char *n = strrchr(di.dli_fname, '/');
+    if (!n) return;
+    if (!strcmp(n, "/Espresso")) nvmtl_nnh_patch_image((const struct mach_header_64 *)mh, "Espresso", NNH_COPY_ALL | NNH_DEFAULT | NNH_PREFERRED);
+    else if (!strcmp(n, "/CoreML")) { nvmtl_nnh_patch_image((const struct mach_header_64 *)mh, "CoreML", NNH_OBSERVER); nvmtl_nnh_coreml(); }
+}
+static void nvmtl_nn_hide_install(void) {
+    static int once;
+    if (once++) return;
+    const char *e = getenv("NVMTL_ALLOW_NN");
+    if (e && e[0] == '1') { nvlog("nn-hide: off (NVMTL_ALLOW_NN=1)"); return; }
+    const char *me = getprogname();
+    if (me && !strcmp(me, "WindowServer")) return;   // runs no inference; keep its shared-cache pages untouched
+    g_nnh_real_copy_all = dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+    g_nnh_real_default = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+    g_nnh_real_preferred = dlsym(RTLD_DEFAULT, "MPSGetPreferredDevice");   // NULL until MPS loads; looked up again with Espresso
+    g_nnh_real_observer = dlsym(RTLD_DEFAULT, "MTLCopyAllDevicesWithObserver");
+    _dyld_register_func_for_add_image(nvmtl_nnh_image);                    // runs now for loaded images, later for new ones
+}

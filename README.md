@@ -56,7 +56,7 @@ The project is especially focused on the experimental [`nullarc`](https://github
 | Realtek ALC269VB audio | Configured, unverified | AppleALC layout 11 + SimpleHDA; not independently validated |
 | Thermal control | Experimental | GPU clock cap and clock-gating LaunchDaemon |
 | H.264 encoding | Experimental | In-process VideoToolbox provider; not a general system-wide encoder |
-| H.264 VCN decoding | Experimental | Build 75 benchmark: 41% less CPU at 1080p real-time; see [BENCHMARKS](macos/nullarc/vcn/BENCHMARKS.md) |
+| H.264 VCN decoding | Experimental | Build 75 benchmark: 41% less CPU at 1080p real-time; see [BENCHMARKS](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md) |
 | HEVC hardware codec | Not implemented | No supported VCN HEVC path yet |
 | Diagnostics and regression tests | Working | Status checks, VCN host tests, VideoToolbox and performance tools |
 
@@ -98,10 +98,11 @@ flowchart TD
 | [`linux/`](linux) | EFI deployment helpers; validated in the maintainer's Arch + systemd-boot setup, not Arch-specific by design |
 | [`macos/display/`](macos/display) | Display stability LaunchDaemon and installer |
 | [`macos/thermal/`](macos/thermal) | GPU clock-cap and clock-gating controls |
-| [`macos/nullarc/`](macos/nullarc) | nullarc install wrappers and local driver patches |
-| [`macos/nullarc/vcn/`](macos/nullarc/vcn) | VCN/VideoToolbox validation, benchmarks and technical notes |
-| [`macos/nullarc/perf/`](macos/nullarc/perf) | WindowServer, CoreAnimation and GPU profiling tools |
-| [`macos/nullarc/tests/`](macos/nullarc/tests) | Reproduction and regression probes |
+| [`macos/nullarc/`](macos/nullarc) | nullarc install wrappers (zip + patch flow) and the historical patches |
+| [`macos/nullarc/nullarc-0.4.0-alpha/`](macos/nullarc/nullarc-0.4.0-alpha) | Our maintained nullarc source: PhxAccel, NVMTL, PhxBringup incl. VCN H.264 decode (build 82), decode plugin, install scripts, tests |
+| [`macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/`](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn) | VCN/VideoToolbox validation, benchmarks and technical notes |
+| [`macos/nullarc/nullarc-0.4.0-alpha/tools/perf/`](macos/nullarc/nullarc-0.4.0-alpha/tools/perf) | WindowServer, CoreAnimation and GPU profiling tools |
+| [`macos/nullarc/nullarc-0.4.0-alpha/tests/macos/`](macos/nullarc/nullarc-0.4.0-alpha/tests/macos) | Reproduction and regression probes |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | Supported installation path, prerequisites and recovery |
 | [`docs/README.md`](docs/README.md) | Documentation index |
 | [`docs/known-issues.md`](docs/known-issues.md) | Detailed issue history and root-cause notes |
@@ -134,7 +135,7 @@ A successful supported build should demonstrate all of the following:
 - Thermal controls load and the machine remains stable under light GPU load.
 - H.264 VideoToolbox encode/decode tests match the documented limitations.
 
-Detailed media evidence is in [BENCHMARKS.md](macos/nullarc/vcn/BENCHMARKS.md), [NEXT.md](macos/nullarc/vcn/NEXT.md) and [known-issues.md](docs/known-issues.md).
+Detailed media evidence is in [BENCHMARKS.md](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md), [NEXT.md](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/NEXT.md) and [known-issues.md](docs/known-issues.md).
 
 ## Known limitations
 

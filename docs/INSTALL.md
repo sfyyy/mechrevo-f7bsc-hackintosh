@@ -27,7 +27,7 @@ It does **not** support a clean install from bare hardware yet, and it must not 
 
 Before starting:
 
-1. Read [known-issues.md](known-issues.md) and the VCN limitations in [macos/nullarc/vcn/README.md](../macos/nullarc/vcn/README.md).
+1. Read [known-issues.md](known-issues.md) and the VCN limitations in [macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md).
 2. Back up the existing EFI partition and any data you cannot lose.
 3. Prepare a bootable Linux or macOS recovery USB and a second computer. The maintainer used Arch Linux, but any environment that can safely access the ESP is acceptable if you know how to use it.
 4. Confirm that Secure Boot, firmware passwords, and disk encryption settings will not block recovery. The complete BIOS checklist is still a roadmap task.
@@ -139,7 +139,7 @@ Record the following results in an issue or local test note:
 - Wi-Fi works; Bluetooth, Ethernet and audio are tested independently.
 - Display and thermal LaunchDaemons are running.
 - No recent WindowServer crash reports.
-- H.264 encoding/decoding claims match [BENCHMARKS.md](../macos/nullarc/vcn/BENCHMARKS.md).
+- H.264 encoding/decoding claims match [BENCHMARKS.md](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md).
 
 ### 7. Rollback
 
@@ -183,7 +183,7 @@ Until these tasks are complete, the project remains an experimental same-model r
 
 开始前：
 
-1. 阅读 [known-issues.md](known-issues.md) 和 [VCN 限制说明](../macos/nullarc/vcn/README.md)。
+1. 阅读 [known-issues.md](known-issues.md) 和 [VCN 限制说明](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md)。
 2. 备份现有 EFI 分区和所有不能丢失的数据。
 3. 准备可启动的 Linux 或 macOS 恢复 U 盘，以及第二台电脑。维护者使用 Arch Linux，但只要你能安全访问 ESP，其他环境同样可以提供所需能力。
 4. 确认 Secure Boot、固件密码和磁盘加密不会阻碍恢复。完整 BIOS 清单仍是路线图任务。
@@ -295,7 +295,7 @@ sudo bash macos/check.sh
 - Wi-Fi 是否可用；蓝牙、有线网卡和声卡是否分别验证。
 - 显示与温控 LaunchDaemon 是否运行。
 - 最近是否有 WindowServer 崩溃报告。
-- H.264 编解码结果是否符合 [BENCHMARKS.md](../macos/nullarc/vcn/BENCHMARKS.md)。
+- H.264 编解码结果是否符合 [BENCHMARKS.md](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md)。
 
 ### 7. 回退
 

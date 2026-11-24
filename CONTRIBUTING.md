@@ -37,7 +37,7 @@ For hardware changes, include the output of:
 sudo bash macos/check.sh
 ```
 
-For VCN changes, also run the checks in [`macos/nullarc/vcn/README.md`](macos/nullarc/vcn/README.md) and record the exact PhxBringup build.
+For VCN changes, also run the checks in [`macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md`](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md) and record the exact PhxBringup build.
 
 ### Commit and review style
 
@@ -81,7 +81,7 @@ make check
 sudo bash macos/check.sh
 ```
 
-涉及 VCN 的改动还应执行 [`macos/nullarc/vcn/README.md`](macos/nullarc/vcn/README.md) 中的检查，并记录准确的 PhxBringup build。
+涉及 VCN 的改动还应执行 [`macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md`](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md) 中的检查，并记录准确的 PhxBringup build。
 
 ### 提交与评审
 

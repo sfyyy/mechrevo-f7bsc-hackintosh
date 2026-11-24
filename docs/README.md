@@ -8,9 +8,9 @@
 |---|---|
 | [INSTALL.md](INSTALL.md) | Current supported installation path, prerequisites, validation and rollback |
 | [known-issues.md](known-issues.md) | Detailed hardware, driver and display issue history with root-cause evidence |
-| [VCN/VideoToolbox README](../macos/nullarc/vcn/README.md) | H.264 encode/decode integration and validation |
-| [VCN benchmarks](../macos/nullarc/vcn/BENCHMARKS.md) | Software-versus-VCN measurements and optimization acceptance criteria |
-| [VCN test history](../macos/nullarc/vcn/NEXT.md) | Real-hardware build history and unresolved technical questions |
+| [VCN/VideoToolbox README](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md) | H.264 encode/decode integration and validation |
+| [VCN benchmarks](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md) | Software-versus-VCN measurements and optimization acceptance criteria |
+| [VCN test history](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/NEXT.md) | Real-hardware build history and unresolved technical questions |
 | [Roadmap](../ROADMAP.md) | Milestones, open tasks, labels and clean-install acceptance gate |
 | [Third-party notices](../THIRD_PARTY_NOTICES.md) | Licenses, sources and redistribution boundaries |
 
@@ -22,9 +22,9 @@ Documentation maturity depends on a clean same-model installation succeeding fro
 |---|---|
 | [INSTALL.md](INSTALL.md) | 当前支持的安装路径、前置条件、验收与回退 |
 | [known-issues.md](known-issues.md) | 详细的硬件、驱动和显示问题历史与根因证据 |
-| [VCN/VideoToolbox README](../macos/nullarc/vcn/README.md) | H.264 编解码接入与验收 |
-| [VCN 性能基准](../macos/nullarc/vcn/BENCHMARKS.md) | 软件解码与 VCN 对比及优化验收标准 |
-| [VCN 测试历史](../macos/nullarc/vcn/NEXT.md) | 真机 build 历史与未解决技术问题 |
+| [VCN/VideoToolbox README](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/README.md) | H.264 编解码接入与验收 |
+| [VCN 性能基准](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md) | 软件解码与 VCN 对比及优化验收标准 |
+| [VCN 测试历史](../macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/NEXT.md) | 真机 build 历史与未解决技术问题 |
 | [路线图](../ROADMAP.md) | 里程碑、待办、标签和全新安装验收门槛 |
 | [第三方声明](../THIRD_PARTY_NOTICES.md) | 许可证、源码出处和再分发边界 |
 

@@ -54,7 +54,7 @@
 | Realtek ALC269VB 声卡 | 已配置，未独立验证 | AppleALC layout 11 + SimpleHDA，尚未单独验收 |
 | 温控 | 实验性 | 核显限频与时钟门控 LaunchDaemon |
 | H.264 编码 | 实验性 | 进程内 VideoToolbox provider，不是通用系统级编码器 |
-| H.264 VCN 硬解 | 实验性 | build 75 实时 1080p 单核 CPU 降低 41%；见 [性能记录](macos/nullarc/vcn/BENCHMARKS.md) |
+| H.264 VCN 硬解 | 实验性 | build 75 实时 1080p 单核 CPU 降低 41%；见 [性能记录](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md) |
 | HEVC 硬件编解码 | 未实现 | 尚无受支持的 VCN HEVC 路径 |
 | 诊断与回归测试 | 可用 | 状态检查、VCN 主机测试、VideoToolbox 与性能工具 |
 
@@ -96,10 +96,11 @@ flowchart TD
 | [`linux/`](linux) | EFI 部署辅助脚本；只在维护者的 Arch + systemd-boot 环境实测，并非 Arch 专用设计 |
 | [`macos/display/`](macos/display) | 显示稳定性 LaunchDaemon 与安装器 |
 | [`macos/thermal/`](macos/thermal) | 核显限频与时钟门控 |
-| [`macos/nullarc/`](macos/nullarc) | nullarc 安装包装与本地驱动补丁 |
-| [`macos/nullarc/vcn/`](macos/nullarc/vcn) | VCN/VideoToolbox 验收、基准与技术记录 |
-| [`macos/nullarc/perf/`](macos/nullarc/perf) | WindowServer、CoreAnimation 和 GPU 性能工具 |
-| [`macos/nullarc/tests/`](macos/nullarc/tests) | 复现与回归测试 |
+| [`macos/nullarc/`](macos/nullarc) | nullarc 安装包装（zip 加补丁流程）与历史补丁 |
+| [`macos/nullarc/nullarc-0.4.0-alpha/`](macos/nullarc/nullarc-0.4.0-alpha) | 本项目维护的 nullarc 源码：PhxAccel、NVMTL、含 VCN H.264 硬解的 PhxBringup（build 82）、解码插件、安装脚本与测试 |
+| [`macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/`](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn) | VCN/VideoToolbox 验收、基准与技术记录 |
+| [`macos/nullarc/nullarc-0.4.0-alpha/tools/perf/`](macos/nullarc/nullarc-0.4.0-alpha/tools/perf) | WindowServer、CoreAnimation 和 GPU 性能工具 |
+| [`macos/nullarc/nullarc-0.4.0-alpha/tests/macos/`](macos/nullarc/nullarc-0.4.0-alpha/tests/macos) | 复现与回归测试 |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | 当前支持的安装路径、前置条件与恢复方式 |
 | [`docs/README.md`](docs/README.md) | 文档索引 |
 | [`docs/known-issues.md`](docs/known-issues.md) | 详细问题历史与根因记录 |
@@ -132,7 +133,7 @@ sudo bash macos/check.sh
 - 温控服务已加载，轻度 GPU 负载下系统稳定。
 - H.264 VideoToolbox 编解码结果符合文档中的限制。
 
-媒体证据见 [BENCHMARKS.md](macos/nullarc/vcn/BENCHMARKS.md)、[NEXT.md](macos/nullarc/vcn/NEXT.md) 和 [known-issues.md](docs/known-issues.md)。
+媒体证据见 [BENCHMARKS.md](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/BENCHMARKS.md)、[NEXT.md](macos/nullarc/nullarc-0.4.0-alpha/docs/vcn/NEXT.md) 和 [known-issues.md](docs/known-issues.md)。
 
 ## 当前限制
 

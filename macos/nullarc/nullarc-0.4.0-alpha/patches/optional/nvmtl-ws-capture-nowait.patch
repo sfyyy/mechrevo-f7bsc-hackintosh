@@ -1,0 +1,120 @@
+--- a/src/nmplugin/NVMTLEventSync.m
++++ b/src/nmplugin/NVMTLEventSync.m
+@@ -6,6 +6,40 @@
+ 
+ @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
+ @implementation NVMTLQueueReservation @end
++// f7bsc capture-nowait: whether surf is one of SkyLight's "Selective Sharing" pool surfaces, in WindowServer only. That
++// pool is the destination of the second, capture-only composite ScreenCaptureKit makes WindowServer draw every frame
++// (WSSelectiveSharingUpdateDisplayStreamSurface). Nothing scans it out and no other process reads it: the next step,
++// DisplayStreamStateMetal::CopyFrame, copies it on the GPU into the client's DisplayStream buffer, and that command
++// buffer is the one that waits and is published. Every Metal queue of a process shares one Vulkan queue, so the copy
++// executes after the composite. With WindowServer's own composite waits on (NVMTL_WS_WAIT_COMPLETION=1, the B-58
++// workaround) and NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1, waiting for this composite cost ~4 ms of the main thread per
++// captured frame: capture ran at every other vsync (17-19 fps for 25 asked) and the display itself dropped from 60 to
++// ~40 fps (2026-11-20). For these surfaces neither wait is taken. NVMTL_WS_CAPTURE_WAIT=1 restores both.
++static BOOL nvmtl_ws_capture_surface(IOSurfaceRef surf) {
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("NVMTL_WS_CAPTURE_WAIT");
++        on = getprogname() && !strcmp(getprogname(), "WindowServer") && !(e && e[0] == '1');
++    }
++    if (!on || !surf) return NO;
++    CFTypeRef name = IOSurfaceCopyValue(surf, CFSTR("IOSurfaceName"));
++    const BOOL isString = name && CFGetTypeID(name) == CFStringGetTypeID();
++    // SkyLight names its pool surfaces "SL.<pid>:<name>" (seen: "SL.201:Selective Sharing"); accept the bare name too.
++    const BOOL capture = isString && (CFEqual(name, CFSTR("Selective Sharing")) ||
++                                      CFStringHasSuffix((CFStringRef)name, CFSTR(":Selective Sharing")));
++    static NSMutableSet *seen;   // each distinct surface name once, to confirm what WindowServer draws into
++    NSString *ns = isString ? (__bridge NSString *)name : @"(none)";
++    @synchronized ([NVMTLQueueReservation class]) {
++        if (!seen) seen = [NSMutableSet new];
++        if (seen.count < 32 && ![seen containsObject:ns]) {
++            [seen addObject:ns];
++            nvlog("capture-nowait: WindowServer writes surface %u named '%s'%s", IOSurfaceGetID(surf), ns.UTF8String,
++                  capture ? " -> capture composite, no completion wait" : "");
++        }
++    }
++    if (name) CFRelease(name);
++    return capture;
++}
+ @interface NVMTLSubmissionPart : NSObject {
+ @public
+     nvk_cmdbuf commands;
+@@ -321,7 +355,7 @@
+     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
+     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
+-    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
++    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable && !nvmtl_ws_capture_surface(s->_surf)) _scheduleAfterPublish = YES;
+     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
+     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
+     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
+--- a/src/nmplugin/NVMTLObjects.m
++++ b/src/nmplugin/NVMTLObjects.m
+@@ -5248,6 +5248,45 @@
+         for (NVMTLTexture *t in part->surfaces) if (t->_surf) return YES;
+     }
+     return NO;
++}
++// f7bsc capture-nowait (see nvmtl_ws_capture_surface in NVMTLEventSync.m): a WindowServer command buffer whose only
++// IOSurface writes go to SkyLight's "Selective Sharing" capture pool does not wait for the GPU here.
++static BOOL nvmtl_cb_writes_only_capture_surfaces(NVMTLCommandBuffer *cb) {
++    BOOL any = NO;
++    for (NVMTLSubmissionPart *part in cb->_parts) {
++        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
++        for (NVMTLTexture *t in part->surfaces) {
++            if (!t->_surf) continue;
++            if (!nvmtl_ws_capture_surface(t->_surf)) return NO;
++            any = YES;
++        }
++    }
++    return any;
++}
++// f7bsc NVMTL_WS_GPUTIME=1: where WindowServer's blocking composite waits go. For each command buffer waited for in
++// commitAndWaitUntilSubmitted: commit -> submitted to Vulkan (plugin CPU), submitted -> GPU start (queued behind other
++// work: the GFX queue is shared by every process), GPU running, GPU end -> completion seen, seen -> waiter woken.
++// Logged every 2 s as average / max in microseconds.
++static void nvmtl_ws_waitstat(double t0, NVMTLCommandBuffer *cb) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_WS_GPUTIME"); on = e && e[0] == '1'; }
++    if (!on) return;
++    const double t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
++    const double ks = [cb kernelStartTime], ke = [cb kernelEndTime], gs = cb.GPUStartTime, ge = cb.GPUEndTime;
++    if (!ks || !ke || !gs || ge < gs) return;
++    const double v[6] = { ks - t0, gs - ks, ge - gs, ke - ge, t1 - ke, t1 - t0 };
++    static double sum[6], mx[6], last; static unsigned n;
++    for (int i = 0; i < 6; i++) { sum[i] += v[i]; if (v[i] > mx[i]) mx[i] = v[i]; }
++    n++;
++    if (!last) last = t1;
++    if (t1 - last < 2.0) return;
++    // Straight to the log file: nvlog keeps only every Nth line of a call site after the first few.
++    FILE *f = fopen(nvmtl_log_path(), "a");
++    if (f) fprintf(f, "pid %d NVMTL: WS wait x%u (avg/max us): submit %.0f/%.0f queued %.0f/%.0f run %.0f/%.0f seen %.0f/%.0f woke %.0f/%.0f total %.0f/%.0f\n",
++          getpid(), n, sum[0]/n*1e6, mx[0]*1e6, sum[1]/n*1e6, mx[1]*1e6, sum[2]/n*1e6, mx[2]*1e6, sum[3]/n*1e6, mx[3]*1e6,
++          sum[4]/n*1e6, mx[4]*1e6, sum[5]/n*1e6, mx[5]*1e6);
++    if (f) fclose(f);
++    memset(sum, 0, sizeof sum); memset(mx, 0, sizeof mx); n = 0; last = t1;
+ }
+ // The display-pipe swap follows this call immediately in WindowServer. NVAccel
+ // cannot order that swap after an NVK fence, so wait for the pixels to finish
+@@ -5257,13 +5296,18 @@
+     static int ws = -1, internalWait = -1;
+     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+     if (internalWait < 0) { const char *e = getenv("NVMTL_WS_WAIT_INTERNAL"); internalWait = e && e[0] == '1'; }
++    const double t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+     [self commit];
+     // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit).
+     // Without it WindowServer still waits here only for a command buffer that wrote an IOSurface. CoreAnimation's
+     // offscreen passes (its set_surface flushes) draw into the plugin's own textures, which only later work on this
+     // in-order queue reads; waiting for each of them serialised CPU and GPU, 1.8 ms a frame while a Phone window was
+     // dragged (2026-10-21). NVMTL_WS_WAIT_INTERNAL=1 waits for those again.
+-    if (ws && !nvmtl_ws_kernel_waits() && (internalWait || nvmtl_cb_writes_surfaces(self))) [self waitUntilCompleted];
++    if (ws && !nvmtl_ws_kernel_waits() && (internalWait || nvmtl_cb_writes_surfaces(self)) &&
++        !nvmtl_cb_writes_only_capture_surfaces(self)) {
++        [self waitUntilCompleted];
++        nvmtl_ws_waitstat(t0, self);
++    }
+     else [self waitUntilScheduled];
+     return self.status != MTLCommandBufferStatusError;
+ }
